@@ -343,8 +343,16 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
-  /** Inject a message into the active Codex thread via turn/start. Returns true if sent. */
-  injectMessage(text: string): boolean {
+  /**
+   * Inject a message into the active Codex thread via turn/start. Returns true if sent.
+   *
+   * Optional budget-tier overrides (plan v2.3 P4/R5) ride on the same turn/start:
+   * `model`/`effort` are sticky for this thread's subsequent turns
+   * (app-server protocol turn.rs: "this turn and subsequent turns"), so callers
+   * own the restore lifecycle. No JSON-RPC error for the request means
+   * transport-accepted — NOT confirmed-applied (turn/started carries no model).
+   */
+  injectMessage(text: string, overrides?: { model?: string; effort?: string }): boolean {
     if (!this.threadId) {
       this.log("Cannot inject: no active thread");
       return false;
@@ -360,11 +368,19 @@ export class CodexAdapter extends EventEmitter {
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
     this.trackBridgeRequestId(requestId);
+    const params: TurnStartParams = { threadId: this.threadId, input: [{ type: "text", text }] };
+    if (overrides?.model) params.model = overrides.model;
+    if (overrides?.effort) params.effort = overrides.effort;
+    if (overrides?.model || overrides?.effort) {
+      this.log(
+        `Budget tier override on turn/start (model=${overrides.model ?? "unchanged"}, effort=${overrides.effort ?? "unchanged"}) — sticky for subsequent turns; transport-accepted unless a JSON-RPC error follows`,
+      );
+    }
     try {
       this.appServerWs.send(JSON.stringify({
         method: "turn/start",
         id: requestId,
-        params: { threadId: this.threadId, input: [{ type: "text", text }] },
+        params,
       } satisfies AppServerRequest<"turn/start", TurnStartParams>));
       return true;
     } catch (err: any) {

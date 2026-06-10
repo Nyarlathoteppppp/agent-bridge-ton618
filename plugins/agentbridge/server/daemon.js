@@ -15,7 +15,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("33d46d8", "source"),
+  commit: defineString("8e4ca6a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -648,7 +648,7 @@ class CodexAdapter extends EventEmitter {
       process.kill(pid, "SIGKILL");
     } catch {}
   }
-  injectMessage(text) {
+  injectMessage(text, overrides) {
     if (!this.threadId) {
       this.log("Cannot inject: no active thread");
       return false;
@@ -664,11 +664,19 @@ class CodexAdapter extends EventEmitter {
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
     this.trackBridgeRequestId(requestId);
+    const params = { threadId: this.threadId, input: [{ type: "text", text }] };
+    if (overrides?.model)
+      params.model = overrides.model;
+    if (overrides?.effort)
+      params.effort = overrides.effort;
+    if (overrides?.model || overrides?.effort) {
+      this.log(`Budget tier override on turn/start (model=${overrides.model ?? "unchanged"}, effort=${overrides.effort ?? "unchanged"}) \u2014 sticky for subsequent turns; transport-accepted unless a JSON-RPC error follows`);
+    }
     try {
       this.appServerWs.send(JSON.stringify({
         method: "turn/start",
         id: requestId,
-        params: { threadId: this.threadId, input: [{ type: "text", text }] }
+        params
       }));
       return true;
     } catch (err) {
@@ -2439,6 +2447,23 @@ function isProcessAlive(pid) {
 // src/config-service.ts
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
 import { join as join3 } from "path";
+var DEFAULT_BUDGET_CONFIG = {
+  enabled: true,
+  pollSeconds: 60,
+  pauseAt: 90,
+  resumeBelow: 30,
+  syncDriftPct: 10,
+  parallel: {
+    minRemainingPct: 60,
+    timeWindowSec: 3600
+  },
+  codexTierControl: false,
+  codexTiers: {
+    full: null,
+    balanced: { effort: "medium" },
+    eco: { effort: "low" }
+  }
+};
 var DEFAULT_CONFIG = {
   version: "1.0",
   codex: {
@@ -2448,7 +2473,8 @@ var DEFAULT_CONFIG = {
   turnCoordination: {
     attentionWindowSeconds: 15
   },
-  idleShutdownSeconds: 30
+  idleShutdownSeconds: 30,
+  budget: DEFAULT_BUDGET_CONFIG
 };
 var CONFIG_DIR = ".agentbridge";
 var CONFIG_FILE = "config.json";
@@ -2464,6 +2490,79 @@ function normalizeInteger(value, fallback) {
       return parsed;
   }
   return fallback;
+}
+function normalizeBoundedInteger(value, fallback, min, max) {
+  const parsed = normalizeInteger(value, fallback);
+  if (parsed < min || parsed > max)
+    return fallback;
+  return parsed;
+}
+function normalizeBoolean(value, fallback) {
+  if (typeof value === "boolean")
+    return value;
+  if (value === "true" || value === "1")
+    return true;
+  if (value === "false" || value === "0")
+    return false;
+  return fallback;
+}
+function normalizeCodexOverride(raw) {
+  if (!isRecord(raw))
+    return null;
+  const override = {};
+  if (typeof raw.model === "string" && raw.model.trim() !== "")
+    override.model = raw.model.trim();
+  if (typeof raw.effort === "string" && raw.effort.trim() !== "")
+    override.effort = raw.effort.trim();
+  return Object.keys(override).length > 0 ? override : null;
+}
+function normalizeCodexTiers(raw) {
+  const tiers = isRecord(raw) ? raw : {};
+  return {
+    full: normalizeCodexOverride(tiers.full),
+    balanced: normalizeCodexOverride(tiers.balanced) ?? DEFAULT_BUDGET_CONFIG.codexTiers.balanced,
+    eco: normalizeCodexOverride(tiers.eco) ?? DEFAULT_BUDGET_CONFIG.codexTiers.eco
+  };
+}
+function normalizeBudgetConfig(raw) {
+  const budget = isRecord(raw) ? raw : {};
+  const parallel = isRecord(budget.parallel) ? budget.parallel : {};
+  const codexTiers = normalizeCodexTiers(budget.codexTiers);
+  let pauseAt = normalizeBoundedInteger(budget.pauseAt, DEFAULT_BUDGET_CONFIG.pauseAt, 1, 100);
+  let resumeBelow = normalizeBoundedInteger(budget.resumeBelow, DEFAULT_BUDGET_CONFIG.resumeBelow, 0, 99);
+  if (pauseAt <= resumeBelow) {
+    pauseAt = DEFAULT_BUDGET_CONFIG.pauseAt;
+    resumeBelow = DEFAULT_BUDGET_CONFIG.resumeBelow;
+  }
+  return {
+    enabled: normalizeBoolean(budget.enabled, DEFAULT_BUDGET_CONFIG.enabled),
+    pollSeconds: normalizeBoundedInteger(budget.pollSeconds, DEFAULT_BUDGET_CONFIG.pollSeconds, 5, 3600),
+    pauseAt,
+    resumeBelow,
+    syncDriftPct: normalizeBoundedInteger(budget.syncDriftPct, DEFAULT_BUDGET_CONFIG.syncDriftPct, 1, 100),
+    parallel: {
+      minRemainingPct: normalizeBoundedInteger(parallel.minRemainingPct, DEFAULT_BUDGET_CONFIG.parallel.minRemainingPct, 1, 100),
+      timeWindowSec: normalizeBoundedInteger(parallel.timeWindowSec, DEFAULT_BUDGET_CONFIG.parallel.timeWindowSec, 60, 604800)
+    },
+    codexTierControl: normalizeBoolean(budget.codexTierControl, DEFAULT_BUDGET_CONFIG.codexTierControl) && codexTiers.full !== null,
+    codexTiers
+  };
+}
+function applyBudgetEnvOverrides(budget, env = process.env) {
+  const overlay = {
+    enabled: env.AGENTBRIDGE_BUDGET_ENABLED ?? budget.enabled,
+    pollSeconds: env.AGENTBRIDGE_BUDGET_POLL_SECONDS ?? budget.pollSeconds,
+    pauseAt: env.AGENTBRIDGE_BUDGET_PAUSE_AT ?? budget.pauseAt,
+    resumeBelow: env.AGENTBRIDGE_BUDGET_RESUME_BELOW ?? budget.resumeBelow,
+    syncDriftPct: env.AGENTBRIDGE_BUDGET_SYNC_DRIFT_PCT ?? budget.syncDriftPct,
+    parallel: {
+      minRemainingPct: env.AGENTBRIDGE_BUDGET_PARALLEL_MIN_REMAINING_PCT ?? budget.parallel.minRemainingPct,
+      timeWindowSec: env.AGENTBRIDGE_BUDGET_PARALLEL_TIME_WINDOW_SEC ?? budget.parallel.timeWindowSec
+    },
+    codexTierControl: env.AGENTBRIDGE_BUDGET_CODEX_TIER_CONTROL ?? budget.codexTierControl,
+    codexTiers: budget.codexTiers
+  };
+  return normalizeBudgetConfig(overlay);
 }
 function normalizeConfig(raw) {
   if (!isRecord(raw))
@@ -2481,7 +2580,8 @@ function normalizeConfig(raw) {
     turnCoordination: {
       attentionWindowSeconds: normalizeInteger(turnCoordination.attentionWindowSeconds, DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds)
     },
-    idleShutdownSeconds: normalizeInteger(config.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds)
+    idleShutdownSeconds: normalizeInteger(config.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds),
+    budget: normalizeBudgetConfig(config.budget)
   };
 }
 
@@ -2531,6 +2631,811 @@ class ConfigService {
   }
 }
 
+// src/budget/budget-state.ts
+var AGENT_LABEL = {
+  claude: "Claude",
+  codex: "Codex"
+};
+var CODEX_BALANCED_WARN_UTIL = 60;
+var CODEX_ECO_WARN_UTIL = 80;
+var CLAUDE_ADVICE_WARN_UTIL = 80;
+function pct(value) {
+  return `${Math.round(value * 10) / 10}%`;
+}
+function formatEpoch(epoch) {
+  if (!epoch || epoch <= 0)
+    return "\u672A\u77E5";
+  return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+}
+function usageSummary(name, usage) {
+  if (!usage)
+    return `${AGENT_LABEL[name]} \u672A\u77E5`;
+  return `${AGENT_LABEL[name]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)} 5h\u91CD\u7F6E=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}`;
+}
+function matchingGateReset(usage, now) {
+  if (!usage)
+    return 0;
+  if (usage.rateLimitedUntil > now)
+    return usage.rateLimitedUntil;
+  const windows = [usage.fiveHour, usage.weekly].filter((window) => !!window && window.resetEpoch > 0);
+  const matching = windows.filter((window) => Math.abs(window.util - usage.gateUtil) < 0.0001);
+  const candidates = matching.length > 0 ? matching : windows;
+  if (candidates.length === 0)
+    return 0;
+  return Math.min(...candidates.map((window) => window.resetEpoch));
+}
+function resumeBlockingEpoch(usage, cfg, now) {
+  if (!usage)
+    return 0;
+  if (usage.rateLimitedUntil > now)
+    return usage.rateLimitedUntil;
+  if (usage.gateUtil >= cfg.resumeBelow)
+    return matchingGateReset(usage, now);
+  return 0;
+}
+function resumeAfterEpoch(claude, codex, cfg, now) {
+  const epochs = [
+    resumeBlockingEpoch(claude, cfg, now),
+    resumeBlockingEpoch(codex, cfg, now)
+  ].filter((epoch) => epoch > 0);
+  if (epochs.length === 0)
+    return null;
+  return Math.max(...epochs);
+}
+function pauseTrigger(agent, usage, cfg, now) {
+  if (!usage)
+    return null;
+  if (usage.rateLimitedUntil > now) {
+    return {
+      agent,
+      reason: `${AGENT_LABEL[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch(usage.rateLimitedUntil)}`
+    };
+  }
+  if (usage.gateUtil >= cfg.pauseAt) {
+    return {
+      agent,
+      reason: `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} \u2265 pauseAt ${pct(cfg.pauseAt)}`
+    };
+  }
+  return null;
+}
+function driftFor(claude, codex, cfg) {
+  if (!claude || !codex)
+    return { pct: 0, heavier: null, lighter: null };
+  const drift = Math.round((claude.warnUtil - codex.warnUtil) * 10) / 10;
+  if (Math.abs(drift) <= cfg.syncDriftPct) {
+    return { pct: drift, heavier: null, lighter: null };
+  }
+  return {
+    pct: drift,
+    heavier: drift > 0 ? "claude" : "codex",
+    lighter: drift > 0 ? "codex" : "claude"
+  };
+}
+function parallelState(claude, codex, cfg, now) {
+  if (!claude || !codex)
+    return { recommended: false, reason: null };
+  if (claude.remaining <= cfg.parallel.minRemainingPct || codex.remaining <= cfg.parallel.minRemainingPct) {
+    return { recommended: false, reason: null };
+  }
+  const claudeReset = claude.fiveHour?.resetEpoch ?? 0;
+  const codexReset = codex.fiveHour?.resetEpoch ?? 0;
+  if (claudeReset <= now || codexReset <= now)
+    return { recommended: false, reason: null };
+  const nearestResetSec = Math.min(claudeReset - now, codexReset - now);
+  if (nearestResetSec >= cfg.parallel.timeWindowSec)
+    return { recommended: false, reason: null };
+  const minutes = Math.ceil(nearestResetSec / 60);
+  return {
+    recommended: true,
+    reason: `\u53CC\u65B9\u5269\u4F59\u989D\u5EA6\u5747\u9AD8\u4E8E ${pct(cfg.parallel.minRemainingPct)}\uFF0C\u6700\u8FD1 5h \u6876\u7EA6 ${minutes} \u5206\u949F\u540E\u91CD\u7F6E`
+  };
+}
+function renderBudgetInterventionDirective(claude, codex, side, reason, resumeEpoch, cfg) {
+  const resumeText = `\u9884\u8BA1\u6062\u590D\u65F6\u95F4\uFF08\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09\uFF1A${formatEpoch(resumeEpoch)}\u3002`;
+  if (side === "claude") {
+    return [
+      "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u989D\u5EA6\u7D27\u5F20\uFF0C\u8FDB\u5165\u63A5\u529B\u6A21\u5F0F\u3002",
+      `\u89E6\u53D1\u65B9\uFF1AClaude\uFF1B\u539F\u56E0\uFF1A${reason}\u3002`,
+      `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
+      `\u6062\u590D\u53C2\u8003\uFF1AClaude gateUtil \u4F4E\u4E8E ${pct(cfg.resumeBelow)} \u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
+      "\u8BF7\u7ACB\u5373\u4EA4\u63A5\uFF1A\u628A\u5269\u4F59\u4EFB\u52A1\u6E05\u5355\u3001\u5173\u952E\u4E0A\u4E0B\u6587\u3001\u4EA7\u51FA\u4F4D\u7F6E\u3001\u9A8C\u6536\u6807\u51C6\u6253\u5305\u6210\u4E00\u6761 reply \u53D1\u7ED9 Codex\u3002",
+      "\u4EA4\u63A5\u540E Claude \u505C\u624B\uFF1B\u8981\u6C42 Codex \u5728\u5355 turn \u5185\u5C3D\u91CF\u5B8C\u6210\uFF0C\u5C3E\u5DF4\u5199 checkpoint\uFF0C\u6682\u505C\u671F\u4E0D\u8981\u671F\u5F85 Claude \u56DE\u590D\u3002"
+    ].join(`
+`);
+  }
+  if (side === "codex") {
+    return [
+      "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u989D\u5EA6\u7D27\u5F20\uFF0C\u6682\u505C\u59D4\u6D3E\u3002",
+      `\u89E6\u53D1\u65B9\uFF1ACodex\uFF1B\u539F\u56E0\uFF1A${reason}\u3002`,
+      `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
+      `\u6062\u590D\u53C2\u8003\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct(cfg.resumeBelow)} \u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
+      "\u8BF7 Claude \u5199 checkpoint\uFF0C\u5E76\u53EF solo \u63A8\u8FDB\u4E0D\u4F9D\u8D56 Codex \u7684\u72EC\u7ACB\u90E8\u5206\uFF1B\u4E0D\u8981\u7EE7\u7EED\u5411 Codex \u59D4\u6D3E\uFF0C\u6807\u6CE8\u6E05\u695A\u5206\u5DE5\u65AD\u70B9\u3002"
+    ].join(`
+`);
+  }
+  return [
+    "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u8FDB\u5165\u8054\u5408\u6682\u505C\u3002",
+    `\u89E6\u53D1\u65B9\uFF1A\u53CC\u65B9\uFF1B\u539F\u56E0\uFF1A${reason}\u3002`,
+    `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
+    `\u6062\u590D\u6761\u4EF6\uFF1AClaude \u4E0E Codex \u7684 gateUtil \u90FD\u4F4E\u4E8E ${pct(cfg.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
+    "\u8BF7\u6536\u5C3E\u5F53\u524D\u6B65\u3001\u5199 checkpoint\u3001\u505C\u6B62\u7EE7\u7EED\u59D4\u6D3E\uFF1Bpause \u671F\u95F4\u4E0D\u8981\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\u3002"
+  ].join(`
+`);
+}
+function balanceDirective(claude, codex, drift, parallel) {
+  const heavier = drift.heavier ? AGENT_LABEL[drift.heavier] : "\u672A\u77E5";
+  const lighter = drift.lighter ? AGENT_LABEL[drift.lighter] : "\u672A\u77E5";
+  const lines = [
+    "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u68C0\u6D4B\u5230\u53CC\u65B9\u7528\u91CF\u6BD4\u4F8B\u6F02\u79FB\u3002",
+    `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
+    `${heavier} \u6BD4 ${lighter} \u9AD8 ${pct(Math.abs(drift.pct))}\uFF0C\u8BF7\u4F18\u5148\u628A\u540E\u7EED\u53EF\u62C6\u5206\u4EFB\u52A1\u5206\u7ED9 ${lighter}\uFF0C\u76F4\u5230 warnUtil \u63A5\u8FD1\u3002`
+  ];
+  if (parallel.recommended && parallel.reason) {
+    lines.push(`${parallel.reason}\uFF1B\u53EF\u8BA9 ${lighter} \u627F\u62C5\u66F4\u591A\u5E76\u884C\u5B50\u4EFB\u52A1\uFF0C\u517C\u987E\u5747\u8861\u4E0E\u63D0\u901F\u3002`);
+  }
+  return lines.join(`
+`);
+}
+function parallelDirective(claude, codex, parallel) {
+  return [
+    "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u5F53\u524D\u989D\u5EA6\u5BCC\u4F59\u4E14\u4E34\u8FD1 5h \u7ED3\u7B97\uFF0C\u5EFA\u8BAE\u52A8\u6001\u5E76\u884C\u3002",
+    `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
+    `${parallel.reason}\uFF1B\u53EF\u4EE5\u62C6\u66F4\u591A\u72EC\u7ACB\u5B50\u4EFB\u52A1\u5E76\u884C\u63A8\u8FDB\u3002`
+  ].join(`
+`);
+}
+function codexTierFor(codex) {
+  if (!codex)
+    return "full";
+  if (codex.warnUtil >= CODEX_ECO_WARN_UTIL)
+    return "eco";
+  if (codex.warnUtil >= CODEX_BALANCED_WARN_UTIL)
+    return "balanced";
+  return "full";
+}
+function claudeAdviceFor(claude) {
+  if (!claude || claude.warnUtil < CLAUDE_ADVICE_WARN_UTIL)
+    return null;
+  return `Claude warnUtil ${pct(claude.warnUtil)} \u5DF2\u504F\u9AD8\uFF1B\u540E\u7EED\u53EF\u62C6\u5206 subagent \u5EFA\u8BAE\u964D\u6863\u5230 haiku/sonnet\uFF0C\u5E76\u4FDD\u7559\u9AD8\u96BE\u5EA6\u4E3B\u7EBF\u7ED9\u5F53\u524D\u4F1A\u8BDD\u3002`;
+}
+function computeBudgetState(claude, codex, cfg, now) {
+  const triggers = [
+    pauseTrigger("claude", claude, cfg, now),
+    pauseTrigger("codex", codex, cfg, now)
+  ].filter((trigger) => trigger !== null);
+  const paused = triggers.length > 0;
+  const drift = driftFor(claude, codex, cfg);
+  const parallel = paused ? { recommended: false, reason: null } : parallelState(claude, codex, cfg, now);
+  const resetEpochs = {
+    claude: matchingGateReset(claude, now),
+    codex: matchingGateReset(codex, now)
+  };
+  const filteredResumeAfterEpoch = paused ? resumeAfterEpoch(claude, codex, cfg, now) : null;
+  let phase = "normal";
+  if (paused)
+    phase = "paused";
+  else if (drift.heavier && drift.lighter)
+    phase = "balance";
+  else if (parallel.recommended)
+    phase = "parallel";
+  const pauseSide = !paused ? null : triggers.length > 1 ? "both" : triggers[0].agent;
+  let directiveToClaude = null;
+  if (phase === "paused") {
+    directiveToClaude = renderBudgetInterventionDirective(claude, codex, pauseSide ?? "both", triggers.map((trigger) => trigger.reason).join("\uFF1B"), filteredResumeAfterEpoch, cfg);
+  } else if (phase === "balance" && claude && codex) {
+    directiveToClaude = balanceDirective(claude, codex, drift, parallel);
+  } else if (phase === "parallel" && claude && codex) {
+    directiveToClaude = parallelDirective(claude, codex, parallel);
+  }
+  return {
+    phase,
+    now,
+    perAgent: { claude, codex },
+    drift,
+    pause: {
+      active: paused,
+      side: pauseSide,
+      reason: paused ? triggers.map((trigger) => trigger.reason).join("\uFF1B") : null,
+      resumeBelow: cfg.resumeBelow,
+      resumeAfterEpoch: filteredResumeAfterEpoch,
+      resetEpochs
+    },
+    parallel,
+    effort: { claudeAdvice: claudeAdviceFor(claude), codexTier: codexTierFor(codex) },
+    directiveToClaude
+  };
+}
+
+// src/budget/budget-coordinator.ts
+var AGENT_LABEL2 = {
+  claude: "Claude",
+  codex: "Codex"
+};
+function pct2(value) {
+  return `${Math.round(value * 10) / 10}%`;
+}
+function usageLine(agent, usage) {
+  if (!usage)
+    return `${AGENT_LABEL2[agent]} \u672A\u77E5`;
+  return `${AGENT_LABEL2[agent]} gate=${pct2(usage.gateUtil)} warn=${pct2(usage.warnUtil)}`;
+}
+function matchingGateReset2(usage, now) {
+  if (!usage)
+    return 0;
+  if (usage.rateLimitedUntil > now)
+    return usage.rateLimitedUntil;
+  const windows = [usage.fiveHour, usage.weekly].filter((window) => !!window && window.resetEpoch > 0);
+  const matching = windows.filter((window) => Math.abs(window.util - usage.gateUtil) < 0.0001);
+  const candidates = matching.length > 0 ? matching : windows;
+  if (candidates.length === 0)
+    return 0;
+  return Math.min(...candidates.map((window) => window.resetEpoch));
+}
+
+class BudgetCoordinator {
+  source;
+  config;
+  emit;
+  onPauseChange;
+  now;
+  log;
+  timer = null;
+  running = false;
+  activeSides = new Set;
+  lastDirectiveFingerprint = null;
+  latestSnapshot = null;
+  pauseReason = null;
+  pauseResumeAfterEpoch = null;
+  pendingOverrideTier = null;
+  pendingOverrides = null;
+  lastAppliedTier = "full";
+  missingFullMappingLogged = false;
+  sequence = 0;
+  constructor(options) {
+    this.source = options.source;
+    this.config = options.config;
+    this.emit = options.emit;
+    this.onPauseChange = options.onPauseChange;
+    this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
+    this.log = options.log ?? (() => {});
+  }
+  async start() {
+    if (this.running || !this.config.enabled)
+      return;
+    this.running = true;
+    await this.pollOnce();
+    if (this.running)
+      this.scheduleNext();
+  }
+  stop() {
+    this.running = false;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+  isPaused() {
+    return this.activeSides.size > 0;
+  }
+  isGateClosed() {
+    return this.activeSides.has("codex");
+  }
+  getSnapshot() {
+    return this.latestSnapshot;
+  }
+  getCodexTurnOverrides() {
+    if (!this.tierControlEnabled())
+      return null;
+    return this.pendingOverrides ? { ...this.pendingOverrides } : null;
+  }
+  notifyOverridesDelivered() {
+    if (!this.pendingOverrideTier)
+      return;
+    this.lastAppliedTier = this.pendingOverrideTier;
+    this.pendingOverrideTier = null;
+    this.pendingOverrides = null;
+  }
+  scheduleNext() {
+    if (!this.running)
+      return;
+    const delayMs = Math.max(0, this.config.pollSeconds * 1000);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.pollAndReschedule();
+    }, delayMs);
+  }
+  async pollAndReschedule() {
+    await this.pollOnce();
+    if (this.running)
+      this.scheduleNext();
+  }
+  async pollOnce() {
+    let usage;
+    try {
+      usage = await this.source.fetchBoth();
+    } catch (error) {
+      this.log(`budget coordinator poll failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (!usage) {
+      if (!this.isPaused())
+        this.latestSnapshot = null;
+      return;
+    }
+    if (!this.running) {
+      return;
+    }
+    const state = computeBudgetState(usage.claude, usage.codex, this.config, this.now());
+    this.updatePendingOverrides(state.effort.codexTier);
+    this.applyState(state);
+    this.latestSnapshot = this.toSnapshot(state);
+  }
+  applyState(state) {
+    const previousSide = this.pauseSide();
+    this.updateActiveSides(state);
+    const currentSide = this.pauseSide();
+    if (currentSide) {
+      this.pauseReason = this.interventionReason(state);
+      const nextResumeAfterEpoch = this.resumeAfterEpoch(state);
+      this.pauseResumeAfterEpoch = previousSide === currentSide ? nextResumeAfterEpoch ?? this.pauseResumeAfterEpoch : nextResumeAfterEpoch;
+      const fingerprint2 = previousSide === currentSide && this.activeSideUsageMissing(state) && this.lastDirectiveFingerprint ? this.lastDirectiveFingerprint : this.directiveFingerprint(state, currentSide);
+      if (!previousSide) {
+        this.onPauseChange(true);
+      }
+      if (!previousSide || previousSide !== currentSide || fingerprint2 !== this.lastDirectiveFingerprint) {
+        this.emitDirective(this.interventionPrefix(currentSide), this.interventionDirective(state, currentSide));
+      }
+      this.lastDirectiveFingerprint = fingerprint2;
+      return;
+    }
+    if (previousSide) {
+      this.pauseReason = null;
+      this.pauseResumeAfterEpoch = null;
+      this.lastDirectiveFingerprint = null;
+      this.onPauseChange(false);
+      this.emitDirective(this.recoveryPrefix(previousSide), this.recoveryDirective(state, previousSide));
+      return;
+    }
+    if (!state.directiveToClaude) {
+      this.lastDirectiveFingerprint = null;
+      return;
+    }
+    const fingerprint = this.directiveFingerprint(state);
+    if (fingerprint !== this.lastDirectiveFingerprint) {
+      const prefix = state.phase === "balance" ? "system_budget_balance" : "system_budget_parallel";
+      this.emitDirective(prefix, state.directiveToClaude);
+      this.lastDirectiveFingerprint = fingerprint;
+    }
+  }
+  updateActiveSides(state) {
+    for (const agent of ["claude", "codex"]) {
+      const usage = state.perAgent[agent];
+      if (this.shouldEnter(usage, state.now)) {
+        this.activeSides.add(agent);
+      } else if (this.activeSides.has(agent) && this.canAgentResume(usage, state.now)) {
+        this.activeSides.delete(agent);
+      }
+    }
+  }
+  shouldEnter(usage, now) {
+    if (!usage)
+      return false;
+    if (usage.rateLimitedUntil > now)
+      return true;
+    return usage.gateUtil >= this.config.pauseAt;
+  }
+  canAgentResume(usage, now) {
+    if (!usage)
+      return false;
+    if (usage.rateLimitedUntil > now)
+      return false;
+    return usage.gateUtil < this.config.resumeBelow;
+  }
+  resumeAfterEpoch(state) {
+    const epochs = ["claude", "codex"].filter((agent) => this.activeSides.has(agent)).map((agent) => this.resumeBlockingEpoch(state.perAgent[agent], state.now)).filter((epoch) => epoch > 0);
+    if (epochs.length === 0)
+      return null;
+    return Math.max(...epochs);
+  }
+  resumeBlockingEpoch(usage, now) {
+    if (!usage)
+      return 0;
+    if (usage.rateLimitedUntil > now)
+      return usage.rateLimitedUntil;
+    if (usage.gateUtil >= this.config.resumeBelow)
+      return matchingGateReset2(usage, now);
+    return 0;
+  }
+  tierControlEnabled() {
+    if (!this.config.codexTierControl)
+      return false;
+    if (this.config.codexTiers.full)
+      return true;
+    if (!this.missingFullMappingLogged) {
+      this.missingFullMappingLogged = true;
+      this.log("Codex tier control disabled: budget.codexTiers.full restore mapping is missing");
+    }
+    return false;
+  }
+  updatePendingOverrides(tier) {
+    if (!this.tierControlEnabled()) {
+      this.pendingOverrideTier = null;
+      this.pendingOverrides = null;
+      return;
+    }
+    if (this.lastAppliedTier === tier) {
+      this.pendingOverrideTier = null;
+      this.pendingOverrides = null;
+      return;
+    }
+    if (this.pendingOverrideTier === tier)
+      return;
+    const overrides = this.config.codexTiers[tier];
+    if (!overrides) {
+      this.pendingOverrideTier = null;
+      this.pendingOverrides = null;
+      return;
+    }
+    this.pendingOverrideTier = tier;
+    this.pendingOverrides = { ...overrides };
+  }
+  directiveFingerprint(state, activeSide) {
+    const side = activeSide ?? (state.phase === "balance" ? state.drift.lighter ?? "none" : state.pause.side ?? "none");
+    let reset = 0;
+    if (activeSide === "claude") {
+      reset = state.pause.resetEpochs.claude;
+    } else if (activeSide === "codex") {
+      reset = state.pause.resetEpochs.codex;
+    } else if (activeSide === "both") {
+      reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
+    } else if (state.phase === "balance" && state.drift.lighter) {
+      reset = state.perAgent[state.drift.lighter]?.fiveHour?.resetEpoch ?? 0;
+    } else if (side === "claude") {
+      reset = state.pause.resetEpochs.claude;
+    } else if (side === "codex") {
+      reset = state.pause.resetEpochs.codex;
+    } else if (side === "both") {
+      reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
+    }
+    return [
+      activeSide ? "paused" : state.phase,
+      state.drift.heavier ?? "none",
+      side,
+      reset
+    ].join("|");
+  }
+  emitDirective(prefix, content) {
+    this.emit(`${prefix}_${this.sequence++}`, content);
+  }
+  pauseSide() {
+    const claude = this.activeSides.has("claude");
+    const codex = this.activeSides.has("codex");
+    if (claude && codex)
+      return "both";
+    if (claude)
+      return "claude";
+    if (codex)
+      return "codex";
+    return null;
+  }
+  interventionPrefix(side) {
+    return side === "claude" ? "system_budget_handoff" : "system_budget_pause";
+  }
+  recoveryPrefix(previousSide) {
+    return previousSide === "claude" ? "system_budget_claude_recovered" : "system_budget_resume";
+  }
+  interventionDirective(state, side) {
+    return renderBudgetInterventionDirective(state.perAgent.claude, state.perAgent.codex, side, this.pauseReason ?? "\u9884\u7B97\u63A5\u8FD1\u8017\u5C3D", this.pauseResumeAfterEpoch, this.config);
+  }
+  interventionReason(state) {
+    return ["claude", "codex"].filter((agent) => this.activeSides.has(agent)).map((agent) => this.activeSideReason(agent, state.perAgent[agent], state.now)).join("\uFF1B");
+  }
+  activeSideUsageMissing(state) {
+    return ["claude", "codex"].some((agent) => this.activeSides.has(agent) && state.perAgent[agent] === null);
+  }
+  activeSideReason(agent, usage, now) {
+    if (!usage)
+      return `${AGENT_LABEL2[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u9884\u7B97\u5E72\u9884`;
+    if (usage.rateLimitedUntil > now) {
+      return `${AGENT_LABEL2[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${this.formatEpoch(usage.rateLimitedUntil)}`;
+    }
+    if (usage.gateUtil >= this.config.pauseAt) {
+      return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u2265 pauseAt ${pct2(this.config.pauseAt)}`;
+    }
+    return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u5C1A\u672A\u4F4E\u4E8E resumeBelow ${pct2(this.config.resumeBelow)}`;
+  }
+  recoveryDirective(state, previousSide) {
+    if (previousSide === "claude") {
+      return [
+        "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u9884\u7B97\u5DF2\u6062\u590D\u3002",
+        `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
+        `Claude gateUtil \u5DF2\u4F4E\u4E8E ${pct2(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+        "Claude \u53EF\u6062\u590D orchestrator \u89D2\u8272\uFF1B\u540E\u7EED\u5206\u914D\u524D\u8BF7\u91CD\u65B0\u67E5\u8BE2\u5B9E\u65F6\u989D\u5EA6\uFF0C\u4E0D\u8981\u4F9D\u8D56\u65E7\u6570\u5B57\u3002"
+      ].join(`
+`);
+    }
+    if (previousSide === "codex") {
+      return [
+        "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u9884\u7B97\u95F8\u95E8\u89E3\u9664\u3002",
+        `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
+        `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct2(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+        "\u5EFA\u8BAE Claude \u7528 reply \u5E26\u4E0A\u5F53\u524D\u76EE\u6807\u3001checkpoint \u548C\u4E0B\u4E00\u6B65\uFF0C\u5524\u9192 Codex \u63A5\u7EED\u6267\u884C\u3002"
+      ].join(`
+`);
+    }
+    return [
+      "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u8054\u5408\u6682\u505C\u89E3\u9664\u3002",
+      `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
+      `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1A\u53CC\u65B9 gateUtil \u5747\u4F4E\u4E8E ${pct2(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+      "\u5EFA\u8BAE Claude \u7528 reply \u5E26\u4E0A\u5F53\u524D\u76EE\u6807\u3001checkpoint \u548C\u4E0B\u4E00\u6B65\uFF0C\u5524\u9192 Codex \u63A5\u7EED\u6267\u884C\u3002"
+    ].join(`
+`);
+  }
+  formatEpoch(epoch) {
+    return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  }
+  toSnapshot(state) {
+    const paused = this.isPaused();
+    return {
+      phase: paused ? "paused" : state.phase,
+      updatedAt: state.now,
+      claude: state.perAgent.claude,
+      codex: state.perAgent.codex,
+      driftPct: state.drift.pct,
+      paused,
+      gateClosed: this.isGateClosed(),
+      pauseSide: this.pauseSide(),
+      pauseReason: paused ? this.pauseReason ?? state.pause.reason : null,
+      resumeAfterEpoch: paused ? this.pauseResumeAfterEpoch ?? state.pause.resumeAfterEpoch : null,
+      parallelRecommended: paused ? false : state.parallel.recommended,
+      codexTier: state.effort.codexTier,
+      claudeAdvice: state.effort.claudeAdvice
+    };
+  }
+}
+
+// src/budget/quota-source.ts
+import { execFile } from "child_process";
+import { existsSync as existsSync5 } from "fs";
+import { homedir as homedir2 } from "os";
+import { basename, join as join4 } from "path";
+var DEFAULT_TIMEOUT_MS = 1e4;
+var MAX_BUFFER = 1024 * 1024;
+function defaultRunner(command, args, options) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, {
+      env: options.env,
+      timeout: options.timeoutMs,
+      maxBuffer: MAX_BUFFER
+    }, (error, stdout) => {
+      if (error && !stdout) {
+        reject(error);
+        return;
+      }
+      resolve({ stdout });
+    });
+  });
+}
+function commandKind(command) {
+  return basename(command) === "probe.mjs" ? "probe-mjs" : "budget-probe";
+}
+function argsFor(candidate, agent) {
+  if (candidate.kind === "probe-mjs")
+    return [agent, "probe"];
+  return ["--agent", agent];
+}
+function asFiniteNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value))
+    return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed))
+      return parsed;
+  }
+  return null;
+}
+function numberOr(value, fallback) {
+  return asFiniteNumber(value) ?? fallback;
+}
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+function asRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
+}
+function normalizeBucket(value, fetchedAt) {
+  const bucket = asRecord(value);
+  if (!bucket)
+    return null;
+  const id = typeof bucket.id === "string" ? bucket.id : "";
+  const util = asFiniteNumber(bucket.util);
+  if (util === null)
+    return null;
+  const resetAfter = asFiniteNumber(bucket.reset_after_seconds ?? bucket.resetAfterSeconds);
+  let resetEpoch = numberOr(bucket.reset_epoch ?? bucket.resetEpoch, 0);
+  if (resetEpoch <= 0 && resetAfter !== null && fetchedAt > 0) {
+    resetEpoch = fetchedAt + resetAfter;
+  }
+  return {
+    id,
+    util: clamp(util, 0, 100),
+    resetEpoch: Math.max(0, resetEpoch),
+    resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter)
+  };
+}
+function normalizeTopLevelBucket(record, util, fetchedAt) {
+  const resetAfter = asFiniteNumber(record.reset_after_seconds ?? record.resetAfterSeconds);
+  let resetEpoch = numberOr(record.reset_epoch ?? record.resetEpoch, 0);
+  if (resetEpoch <= 0 && resetAfter !== null && fetchedAt > 0) {
+    resetEpoch = fetchedAt + resetAfter;
+  }
+  if (resetEpoch <= 0 && resetAfter === null)
+    return null;
+  return {
+    id: "top_level",
+    util: clamp(util, 0, 100),
+    resetEpoch: Math.max(0, resetEpoch),
+    resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter)
+  };
+}
+function toWindow(bucket) {
+  if (!bucket)
+    return null;
+  return { util: bucket.util, resetEpoch: bucket.resetEpoch };
+}
+function bucketSortKey(bucket) {
+  if (bucket.resetAfterSeconds !== null)
+    return bucket.resetAfterSeconds;
+  if (bucket.resetEpoch > 0)
+    return bucket.resetEpoch;
+  return Number.POSITIVE_INFINITY;
+}
+function sameBucketWindow(bucket, window) {
+  return !!window && bucket.util === window.util && bucket.resetEpoch === window.resetEpoch;
+}
+function pickHighestUtil(buckets) {
+  if (buckets.length === 0)
+    return null;
+  return buckets.reduce((best, current) => {
+    if (current.util > best.util)
+      return current;
+    if (current.util === best.util && bucketSortKey(current) < bucketSortKey(best))
+      return current;
+    return best;
+  });
+}
+function identifyWindows(buckets) {
+  const fiveHourMatches = buckets.filter((bucket) => bucket.id.includes("five_hour") || bucket.id.includes("primary_window"));
+  const weeklyMatches = buckets.filter((bucket) => bucket.id.includes("seven_day") || bucket.id.includes("secondary_window"));
+  let fiveHour = toWindow(pickHighestUtil(fiveHourMatches));
+  let weekly = toWindow(pickHighestUtil(weeklyMatches));
+  const sorted = [...buckets].sort((a, b) => bucketSortKey(a) - bucketSortKey(b));
+  if (!fiveHour && sorted.length > 0) {
+    fiveHour = toWindow(sorted[0]);
+  }
+  if (!weekly && sorted.length > 1) {
+    const latestDistinct = [...sorted].reverse().find((bucket) => !sameBucketWindow(bucket, fiveHour));
+    weekly = toWindow(latestDistinct);
+  }
+  return { fiveHour, weekly };
+}
+function normalizeProbeResult(raw) {
+  const record = asRecord(raw);
+  if (!record)
+    return null;
+  const fetchedAt = numberOr(record.fetched_at ?? record.fetchedAt ?? record.now_epoch ?? record.nowEpoch, 0);
+  const gateUtil = clamp(numberOr(record.util ?? record.hard_util ?? record.hardUtil, 0), 0, 100);
+  const warnUtil = clamp(numberOr(record.warn_util ?? record.warnUtil, gateUtil), 0, 100);
+  const rawBuckets = Array.isArray(record.buckets) ? record.buckets : [];
+  const buckets = rawBuckets.map((bucket) => normalizeBucket(bucket, fetchedAt)).filter((bucket) => bucket !== null);
+  if (buckets.length === 0) {
+    const topLevelBucket = normalizeTopLevelBucket(record, gateUtil, fetchedAt);
+    if (topLevelBucket)
+      buckets.push(topLevelBucket);
+  }
+  const rateLimitedUntil = Math.max(0, numberOr(record.rate_limited_until ?? record.rateLimitedUntil, 0));
+  const ok = record.ok === true;
+  if (!ok && rateLimitedUntil <= 0 && buckets.length === 0)
+    return null;
+  const { fiveHour, weekly } = identifyWindows(buckets);
+  return {
+    ok,
+    stale: record.stale === true,
+    gateUtil,
+    warnUtil,
+    fiveHour,
+    weekly,
+    remaining: clamp(100 - gateUtil, 0, 100),
+    rateLimitedUntil,
+    fetchedAt
+  };
+}
+function withTimeout(promise, timeoutMs) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`budget probe timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer)
+      clearTimeout(timer);
+  });
+}
+
+class QuotaSource {
+  env;
+  homeDir;
+  timeoutMs;
+  runner;
+  log;
+  constructor(options = {}) {
+    this.env = options.env ?? process.env;
+    this.homeDir = options.homeDir ?? homedir2();
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.runner = options.runner ?? defaultRunner;
+    this.log = options.log ?? (() => {});
+  }
+  async fetchBoth() {
+    const candidates = this.findProbeCandidates();
+    if (candidates.length === 0)
+      return null;
+    const [claude, codex] = await Promise.all([
+      this.fetchAgent(candidates, "claude"),
+      this.fetchAgent(candidates, "codex")
+    ]);
+    return { claude, codex };
+  }
+  findProbeCandidates() {
+    const candidates = [];
+    const seen = new Set;
+    const add = (command, kind) => {
+      const key = `${kind}:${command}`;
+      if (seen.has(key))
+        return;
+      seen.add(key);
+      candidates.push({ command, kind });
+    };
+    const explicit = this.env.AGENTBRIDGE_QUOTA_PROBE || this.env.BUDGET_PROBE;
+    if (explicit && explicit.trim() !== "") {
+      const command = explicit.trim();
+      add(command, commandKind(command));
+      return candidates;
+    }
+    const binDir = join4(this.homeDir, ".budget-guard/bin");
+    const installedBudgetProbe = join4(binDir, "budget-probe");
+    if (existsSync5(installedBudgetProbe))
+      add(installedBudgetProbe, "budget-probe");
+    const installedProbeMjs = join4(binDir, "probe.mjs");
+    if (existsSync5(installedProbeMjs))
+      add(installedProbeMjs, "probe-mjs");
+    return candidates;
+  }
+  async fetchAgent(candidates, agent) {
+    for (const candidate of candidates) {
+      try {
+        const result = await withTimeout(this.runner(candidate.command, argsFor(candidate, agent), {
+          env: this.env,
+          timeoutMs: this.timeoutMs,
+          agent
+        }), this.timeoutMs);
+        const text = String(result.stdout).trim();
+        if (!text)
+          continue;
+        const usage = normalizeProbeResult(JSON.parse(text));
+        if (usage)
+          return usage;
+        this.log(`budget probe returned no usable data for ${agent}: ${candidate.command}`);
+      } catch (error) {
+        this.log(`budget probe failed for ${agent}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return null;
+  }
+}
+function createQuotaSource(options) {
+  return new QuotaSource(options);
+}
+
 // src/reply-required-tracker.ts
 class ReplyRequiredTracker {
   armed = false;
@@ -2556,6 +3461,156 @@ class ReplyRequiredTracker {
     this.forwardedDuringTurn = false;
   }
 }
+
+// src/thread-state.ts
+import {
+  existsSync as existsSync6,
+  mkdirSync as mkdirSync5,
+  readdirSync,
+  readFileSync as readFileSync3,
+  renameSync as renameSync2,
+  writeFileSync as writeFileSync3
+} from "fs";
+import { homedir as homedir3 } from "os";
+import { basename as basename2, dirname as dirname2, join as join5 } from "path";
+function nowIso() {
+  return new Date().toISOString();
+}
+function threadTag(identity) {
+  const name = identity.pairName ?? identity.pairId ?? "manual";
+  return `abg:${name}:${identity.cwd}`;
+}
+function codexHome(env = process.env) {
+  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join5(homedir3(), ".codex");
+}
+function atomicWriteJson(path, value) {
+  mkdirSync5(dirname2(path), { recursive: true });
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+  writeFileSync3(tmp, JSON.stringify(value, null, 2) + `
+`, "utf-8");
+  renameSync2(tmp, path);
+}
+function readRawCurrentThread(stateDir) {
+  try {
+    const parsed = JSON.parse(readFileSync3(stateDir.currentThreadFile, "utf-8"));
+    if (parsed?.version === 1 && typeof parsed.threadId === "string" && parsed.threadId.length > 0 && (parsed.status === "pending" || parsed.status === "current") && typeof parsed.cwd === "string") {
+      return parsed;
+    }
+  } catch {}
+  return null;
+}
+function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
+  const sessionsDir = join5(codexHome(env), "sessions");
+  if (!threadId || !existsSync6(sessionsDir))
+    return null;
+  const exactName = `rollout-${threadId}.jsonl`;
+  const stack = [sessionsDir];
+  let visited = 0;
+  while (stack.length > 0 && visited < maxEntries) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      visited++;
+      const path = join5(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(path);
+        continue;
+      }
+      if (!entry.isFile())
+        continue;
+      const name = basename2(entry.name);
+      if (name === exactName || name.startsWith("rollout-") && name.endsWith(".jsonl") && name.includes(threadId)) {
+        return path;
+      }
+    }
+  }
+  return null;
+}
+function writePendingCurrentThread(identity, threadId, reason) {
+  const state = {
+    version: 1,
+    status: "pending",
+    pairId: identity.pairId,
+    pairName: identity.pairName,
+    cwd: identity.cwd,
+    threadId,
+    updatedAt: nowIso(),
+    reason,
+    tag: threadTag(identity)
+  };
+  atomicWriteJson(identity.stateDir.currentThreadFile, state);
+  return state;
+}
+function promoteCurrentThreadIfRolloutExists(identity, threadId, reason, env = process.env) {
+  const rolloutPath = findCodexRolloutFile(threadId, env);
+  const state = {
+    version: 1,
+    status: rolloutPath ? "current" : "pending",
+    pairId: identity.pairId,
+    pairName: identity.pairName,
+    cwd: identity.cwd,
+    threadId,
+    updatedAt: nowIso(),
+    reason,
+    tag: threadTag(identity),
+    ...rolloutPath ? { rolloutPath, rolloutVerifiedAt: nowIso() } : {}
+  };
+  atomicWriteJson(identity.stateDir.currentThreadFile, state);
+  return state;
+}
+async function persistCurrentThreadWithRolloutRetry(identity, threadId, reason, options = {}) {
+  const env = options.env ?? process.env;
+  const attempts = options.attempts ?? 20;
+  const delayMs = options.delayMs ?? 250;
+  const shouldContinue = options.shouldContinue ?? (() => true);
+  if (!shouldContinue())
+    return null;
+  writePendingCurrentThread(identity, threadId, reason);
+  for (let attempt = 1;attempt <= attempts; attempt++) {
+    if (!shouldContinue()) {
+      options.log?.(`Abandoned current-thread persistence for ${threadId}: a newer thread became active`);
+      return null;
+    }
+    const state = promoteCurrentThreadIfRolloutExists(identity, threadId, reason, env);
+    if (state.status === "current") {
+      options.log?.(`Current Codex thread persisted: ${threadId} (${state.rolloutPath})`);
+      return state;
+    }
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  if (!shouldContinue())
+    return null;
+  options.log?.(`Current Codex thread left pending because no rollout file was found: ${threadId}`);
+  return readRawCurrentThread(identity.stateDir) ?? writePendingCurrentThread(identity, threadId, reason);
+}
+
+// src/waiting-message.ts
+function formatWaitingForCodexTuiMessage(options) {
+  const pairName = options.pairName ?? "unknown";
+  const pairId = options.pairId ?? "manual";
+  const slot = options.slot === null || options.slot === undefined ? "manual" : String(options.slot);
+  return [
+    "\u23F3 Waiting for Codex TUI to connect.",
+    `Current pair: cwd=${options.cwd} pair=${pairName} pairId=${pairId} slot=${slot} proxy=${options.proxyUrl}`,
+    "If Codex was started from a different cwd, it belongs to another pair and will not attach here.",
+    "Run in another terminal:",
+    options.attachCmd,
+    "For diagnostics: abg doctor"
+  ].join(`
+`);
+}
+
+// src/pair-registry.ts
+var PAIR_BASE_PORT = 4500;
+var PAIR_SLOT_STRIDE = 10;
+var MAX_PAIR_SLOT = Math.floor((65535 - 2 - PAIR_BASE_PORT) / PAIR_SLOT_STRIDE);
 
 // src/thread-state.ts
 import {
@@ -2753,6 +3808,7 @@ var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?
 var BOOTSTRAP_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_BOOTSTRAP_TIMEOUT_MS", 45000);
 var CODEX_BOOT_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_CODEX_BOOT_RETRIES", 2);
 var ALLOW_IDENTITYLESS_CLIENT = process.env.AGENTBRIDGE_COMPAT_IDENTITYLESS === "1";
+var BUDGET_CONFIG = applyBudgetEnvOverrides(config.budget);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
@@ -2774,6 +3830,47 @@ var LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_
 var LIVENESS_PROBE_POLL_MS = 50;
 var challengeInProgress = false;
 var bufferedMessages = [];
+var budgetCoordinator = null;
+var budgetStatusTimer = null;
+function ensureBudgetCoordinatorStarted() {
+  if (!BUDGET_CONFIG.enabled)
+    return;
+  if (!budgetCoordinator) {
+    log(`Budget coordinator config: pollSeconds=${BUDGET_CONFIG.pollSeconds} pauseAt=${BUDGET_CONFIG.pauseAt} ` + `resumeBelow=${BUDGET_CONFIG.resumeBelow} syncDriftPct=${BUDGET_CONFIG.syncDriftPct} ` + `parallel=${BUDGET_CONFIG.parallel.minRemainingPct}%/${BUDGET_CONFIG.parallel.timeWindowSec}s ` + `codexTierControl=${BUDGET_CONFIG.codexTierControl} ` + `codexTiersFull=${BUDGET_CONFIG.codexTiers.full ? "configured" : "missing"}`);
+    budgetCoordinator = new BudgetCoordinator({
+      source: createQuotaSource({ log }),
+      config: BUDGET_CONFIG,
+      emit: (id, content) => {
+        emitToClaude(systemMessage(id, content));
+        queueMicrotask(() => broadcastStatus());
+      },
+      onPauseChange: (paused) => {
+        log(`Budget intervention ${paused ? "ACTIVE" : "CLEARED"} ` + `(gate ${budgetCoordinator?.isGateClosed() ? "CLOSED" : "OPEN"})`);
+        queueMicrotask(() => broadcastStatus());
+      },
+      log
+    });
+  }
+  budgetCoordinator.start();
+  if (!budgetStatusTimer) {
+    budgetStatusTimer = setInterval(() => broadcastStatus(), BUDGET_CONFIG.pollSeconds * 1000);
+    budgetStatusTimer.unref?.();
+  }
+}
+function stopBudgetCoordinator() {
+  budgetCoordinator?.stop();
+  if (budgetStatusTimer) {
+    clearInterval(budgetStatusTimer);
+    budgetStatusTimer = null;
+  }
+}
+function budgetPauseGateError() {
+  const snapshot = budgetCoordinator?.getSnapshot() ?? null;
+  const reason = snapshot?.pauseReason ?? "Codex \u4FA7\u989D\u5EA6\u63A5\u8FD1\u8017\u5C3D";
+  const resumeAt = snapshot?.resumeAfterEpoch ? new Date(snapshot.resumeAfterEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z") : null;
+  const sideHint = snapshot?.pauseSide === "both" ? "\u53CC\u4FA7\u989D\u5EA6\u5747\u5DF2\u8017\u5C3D\uFF0C\u8BF7\u5199 checkpoint \u7B49\u5F85\u5237\u65B0" : "\u4F60\u53EF\u7EE7\u7EED solo \u63A8\u8FDB\u53EF\u72EC\u7ACB\u90E8\u5206\uFF0C\u5E76\u5199 checkpoint \u6807\u6CE8\u5206\u5DE5\u65AD\u70B9";
+  return `\u9884\u7B97\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\uFF1A${reason}\u3002` + `Codex \u4FA7 gateUtil \u4F4E\u4E8E ${BUDGET_CONFIG.resumeBelow}% \u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00` + (resumeAt ? `\uFF08\u9884\u8BA1\u6062\u590D ${resumeAt}\uFF0C\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09` : "") + `\u3002\u6536\u5230 RESUME \u901A\u77E5\u524D\u8BF7\u52FF\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\uFF1B${sideHint}\u3002`;
+}
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
@@ -2854,6 +3951,7 @@ codex.on("ready", (threadId) => {
   log(`Codex ready \u2014 thread ${threadId}`);
   log("Bridge fully operational");
   emitToClaude(systemMessage("system_ready", currentReadyMessage()));
+  ensureBudgetCoordinatorStarted();
 });
 codex.on("threadChanged", (event) => {
   broadcastStatus();
@@ -2992,13 +4090,25 @@ function handleControlMessage(ws, raw) {
         });
         return;
       }
+      if (budgetCoordinator?.isGateClosed()) {
+        const reason = budgetPauseGateError();
+        log(`Injection rejected by budget pause gate`);
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: false,
+          error: reason
+        });
+        return;
+      }
       const requireReply = !!message.requireReply;
       let contentToSend = message.message.content;
       if (requireReply) {
         contentToSend += REPLY_REQUIRED_INSTRUCTION;
       }
       log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const injected = codex.injectMessage(contentToSend);
+      const tierOverrides = BUDGET_CONFIG.codexTierControl ? budgetCoordinator?.getCodexTurnOverrides() ?? undefined : undefined;
+      const injected = codex.injectMessage(contentToSend, tierOverrides);
       if (!injected) {
         const reason = codex.turnInProgress ? "Codex is busy executing a turn. Wait for it to finish before sending another message." : "Injection failed: no active thread or WebSocket not connected.";
         log(`Injection rejected: ${reason}`);
@@ -3009,6 +4119,9 @@ function handleControlMessage(ws, raw) {
           error: reason
         });
         return;
+      }
+      if (tierOverrides) {
+        budgetCoordinator?.notifyOverridesDelivered();
       }
       if (requireReply) {
         replyTracker.arm();
@@ -3267,7 +4380,8 @@ function currentStatus() {
     pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
     cwd: process.cwd(),
     stateDir: stateDir.dir,
-    build: daemonStatusBuildInfo()
+    build: daemonStatusBuildInfo(),
+    budget: budgetCoordinator?.getSnapshot() ?? undefined
   };
 }
 function currentWaitingMessage() {
@@ -3373,6 +4487,7 @@ function shutdown(reason, exitCode = 0) {
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
   clearBootDeadline();
+  stopBudgetCoordinator();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();

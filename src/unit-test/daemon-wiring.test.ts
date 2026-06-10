@@ -37,6 +37,11 @@ interface Harness {
   close: () => Promise<void>;
   sendAppCommand: (command: string) => void;
   attachClaude: () => Promise<void>;
+  /** Control socket from attachClaude (for sending claude_to_codex etc.). */
+  controlWs: WebSocket | null;
+  /** Connect a fake Codex TUI to the proxy and complete the thread/start handshake. */
+  connectTui: () => Promise<void>;
+  sendClaudeToCodex: (requestId: string, text: string) => void;
 }
 
 const harnesses: Harness[] = [];
@@ -94,11 +99,366 @@ describe("daemon wiring", () => {
     expect(aborted.content).toContain("app-server connection closed");
     expect(aborted.content).toContain("retry");
   }, 20000);
+
+  test("budget pause gate: STOP directive, reply rejected, RESUME reopens", async () => {
+    // Fixture probe driven by per-agent JSON files the test rewrites at runtime
+    // (explicit AGENTBRIDGE_QUOTA_PROBE is exclusive — no fallback to real probes).
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 600 },
+          ],
+        }),
+      );
+    };
+    writeUsage("claude", 10);
+    writeUsage("codex", 95); // trips the default pauseAt=90 on the coordinator's first poll
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgetabcd",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+        },
+      });
+
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Coordinator starts on codex "ready"; its immediate first poll sees codex ≥ 90.
+      const stop = await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_budget_pause_"),
+        "system_budget_pause directive",
+      );
+      expect(stop.content).toContain("暂停委派");
+      expect(stop.content).toContain("checkpoint");
+
+      // Gate closed: claude_to_codex is refused with the budget error.
+      harness.sendClaudeToCodex("req-budget-1", "hello during pause");
+      await waitFor(
+        () =>
+          harness.statusMessages.some(
+            (m) => m.type === "claude_to_codex_result" && m.requestId === "req-budget-1",
+          ),
+        "claude_to_codex_result for req-budget-1",
+      );
+      const rejected = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-budget-1",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(rejected.success).toBe(false);
+      expect(rejected.error).toContain("预算暂停（闸门关闭）");
+      expect(rejected.error).toContain("checkpoint");
+
+      // DaemonStatus.budget reflects the pause.
+      const healthz = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+      const status = (await healthz.json()) as DaemonStatus;
+      expect(status.budget?.paused).toBe(true);
+      expect(status.budget?.phase).toBe("paused");
+
+      // Drop the tripping side below resumeBelow → next poll (≤5s) resumes.
+      writeUsage("codex", 5);
+      await waitFor(
+        () => harness.messages.some((message) => message.id.startsWith("system_budget_resume_")),
+        "system_budget_resume directive",
+        400, // 20s — generous margin over the 5s poll for slow CI machines
+        50,
+      );
+      const resume = harness.messages.find((message) => message.id.startsWith("system_budget_resume_"))!;
+      expect(resume.content).toContain("Codex 侧预算闸门解除");
+
+      // Gate open again: the same injection now succeeds.
+      harness.sendClaudeToCodex("req-budget-2", "hello after resume");
+      await waitFor(
+        () =>
+          harness.statusMessages.some(
+            (m) => m.type === "claude_to_codex_result" && m.requestId === "req-budget-2",
+          ),
+        "claude_to_codex_result for req-budget-2",
+      );
+      const accepted = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-budget-2",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(accepted.success).toBe(true);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  test("budget pause is visible without an attached Claude; STOP is buffered until attach", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-buffer-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const usage = (gateUtil: number) =>
+      JSON.stringify({
+        ok: true,
+        util: gateUtil,
+        warn_util: gateUtil,
+        fetched_at: Math.floor(Date.now() / 1000),
+        buckets: [
+          { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 600 },
+        ],
+      });
+    writeFileSync(join(fixtureRoot, "usage-claude.json"), usage(10));
+    writeFileSync(join(fixtureRoot, "usage-codex.json"), usage(95));
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgetbuf1",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+        },
+      });
+
+      // No attachClaude yet — only the TUI handshake, so the coordinator starts
+      // and pauses while no Claude frontend is connected.
+      await harness.connectTui();
+
+      // Pause is observable via /healthz even with no Claude attached.
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.paused === true;
+        } catch {
+          return false;
+        }
+      }, "budget.paused visible on /healthz without attached Claude", 200, 100);
+
+      // Attaching now must deliver the buffered STOP directive.
+      await harness.attachClaude();
+      const stop = await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_budget_pause_"),
+        "buffered system_budget_pause after attach",
+      );
+      expect(stop.content).toContain("暂停委派");
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  test("claude-side handoff keeps the gate OPEN; codex escalation closes it (v2.4)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-handoff-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 600 },
+          ],
+        }),
+      );
+    };
+    writeUsage("claude", 93); // Claude-only trigger → handoff, gate stays open
+    writeUsage("codex", 10);
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgethand",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+        },
+      });
+
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Handoff directive (NOT the pause id) arrives on the first poll.
+      const handoff = await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_budget_handoff_"),
+        "system_budget_handoff directive",
+      );
+      expect(handoff.content).toContain("交接");
+
+      // The baton reply goes THROUGH — gate is open for a Claude-only trigger.
+      harness.sendClaudeToCodex("req-handoff-1", "baton: remaining tasks + acceptance criteria");
+      await waitFor(
+        () =>
+          harness.statusMessages.some(
+            (m) => m.type === "claude_to_codex_result" && m.requestId === "req-handoff-1",
+          ),
+        "claude_to_codex_result for req-handoff-1",
+      );
+      const baton = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-handoff-1",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(baton.success).toBe(true);
+
+      // Snapshot: intervention active, gate open, side=claude.
+      const healthz = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+      const status = (await healthz.json()) as DaemonStatus;
+      expect(status.budget?.paused).toBe(true);
+      expect(status.budget?.gateClosed).toBe(false);
+      expect(status.budget?.pauseSide).toBe("claude");
+
+      // Escalation: codex also trips → upgrade to joint pause, gate closes.
+      writeUsage("codex", 95);
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const s = (await res.json()) as DaemonStatus;
+          return s.budget?.gateClosed === true && s.budget?.pauseSide === "both";
+        } catch {
+          return false;
+        }
+      }, "escalation to joint pause (gateClosed + both)", 400, 50);
+
+      harness.sendClaudeToCodex("req-handoff-2", "should be gated now");
+      await waitFor(
+        () =>
+          harness.statusMessages.some(
+            (m) => m.type === "claude_to_codex_result" && m.requestId === "req-handoff-2",
+          ),
+        "claude_to_codex_result for req-handoff-2",
+      );
+      const gated = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-handoff-2",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(gated.success).toBe(false);
+      expect(gated.error).toContain("闸门关闭");
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  test("codex tier overrides ride on turn/start and restore explicitly (P4/R5)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-tier-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 7200 },
+          ],
+        }),
+      );
+    };
+    writeUsage("claude", 10);
+    writeUsage("codex", 85); // eco band (≥80) but below pauseAt=90 — no pause
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    const readTurnStarts = (): Array<Record<string, unknown>> => {
+      if (!existsSync(turnStartLog)) return [];
+      return readFileSync(turnStartLog, "utf-8")
+        .trim()
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line));
+    };
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgettier",
+        pairName: "main",
+        projectConfig: {
+          version: "1.0",
+          budget: {
+            codexTierControl: true,
+            codexTiers: { full: { effort: "high" } }, // explicit restore point activates control
+          },
+        },
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          FAKE_APP_TURNSTART_LOG: turnStartLog,
+        },
+      });
+
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Wait until the coordinator's first poll computed the eco tier.
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.codexTier === "eco";
+        } catch {
+          return false;
+        }
+      }, "codexTier=eco on /healthz", 200, 100);
+
+      // Injection 1 carries the eco override (default mapping effort=low).
+      harness.sendClaudeToCodex("req-tier-1", "task under eco tier");
+      await waitFor(() => readTurnStarts().length >= 1, "first recorded turn/start", 100, 100);
+      const first = readTurnStarts()[0]!;
+      expect(first.effort).toBe("low");
+
+      // Tier returns to full → explicit restore override on the next injection.
+      writeUsage("codex", 10);
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.codexTier === "full";
+        } catch {
+          return false;
+        }
+      }, "codexTier back to full", 400, 50);
+      harness.sendClaudeToCodex("req-tier-2", "task after restore");
+      await waitFor(() => readTurnStarts().length >= 2, "second recorded turn/start", 100, 100);
+      const second = readTurnStarts()[1]!;
+      expect(second.effort).toBe("high"); // configured codexTiers.full restore value
+
+      // Pending consumed: a further injection carries NO override.
+      harness.sendClaudeToCodex("req-tier-3", "steady state");
+      await waitFor(() => readTurnStarts().length >= 3, "third recorded turn/start", 100, 100);
+      const third = readTurnStarts()[2]!;
+      expect(third.effort).toBeUndefined();
+      expect(third.model).toBeUndefined();
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
 });
 
 async function startHarness(opts: {
   pairId: string;
   pairName: string;
+  extraEnv?: Record<string, string>;
+  /** Optional .agentbridge/config.json content written into the daemon cwd before spawn. */
+  projectConfig?: unknown;
 }): Promise<Harness> {
   const root = mkdtempSync(join(tmpdir(), "agentbridge-daemon-wiring-"));
   const cwdPath = join(root, "project");
@@ -109,6 +469,11 @@ async function startHarness(opts: {
   const cwd = realpathSync(cwdPath);
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(binDir, { recursive: true });
+
+  if (opts.projectConfig !== undefined) {
+    mkdirSync(join(cwd, ".agentbridge"), { recursive: true });
+    writeFileSync(join(cwd, ".agentbridge", "config.json"), JSON.stringify(opts.projectConfig));
+  }
 
   const { slot, ports } = await reserveFreePairSlot();
   const { appPort, proxyPort, controlPort } = ports;
@@ -130,6 +495,11 @@ async function startHarness(opts: {
     CODEX_WS_PORT: String(appPort),
     CODEX_PROXY_PORT: String(proxyPort),
     FAKE_APP_COMMAND_FILE: commandFile,
+    // Hermetic default: a test daemon must never poll the REAL installed budget
+    // probe (~/.budget-guard/bin). Budget tests opt back in via extraEnv with an
+    // explicit fixture probe (explicit env probes are exclusive — no fallback).
+    AGENTBRIDGE_BUDGET_ENABLED: "0",
+    ...(opts.extraEnv ?? {}),
   };
 
   const daemon = spawn("bun", ["run", DAEMON_PATH], {
@@ -171,6 +541,7 @@ async function startHarness(opts: {
     },
     attachClaude: async () => {
       const ws = await connectControlSocket(controlPort);
+      harness.controlWs = ws;
       ws.onmessage = (event) => {
         const raw = typeof event.data === "string" ? event.data : event.data.toString();
         const message = JSON.parse(raw) as ControlServerMessage;
@@ -191,6 +562,43 @@ async function startHarness(opts: {
         },
       }));
     },
+    controlWs: null,
+    connectTui: async () => {
+      // A fake Codex TUI: connect to the proxy and start a thread. The fake
+      // app-server auto-responds to thread/start, which drives the adapter to
+      // setActiveThreadId → "ready" → canReply() truthy (with TUI connected).
+      const tuiWs = new WebSocket(`ws://127.0.0.1:${proxyPort}`);
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("TUI ws connect timeout")), 5000);
+        tuiWs.onopen = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        tuiWs.onerror = () => {
+          clearTimeout(timer);
+          reject(new Error("TUI ws connect error"));
+        };
+      });
+      tuiWs.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }));
+      // Wait until the daemon reports bridge-ready over /healthz.
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.bridgeReady === true;
+        } catch {
+          return false;
+        }
+      }, "bridge ready after TUI handshake", 100, 100);
+    },
+    sendClaudeToCodex: (requestId: string, text: string) => {
+      harness.controlWs?.send(JSON.stringify({
+        type: "claude_to_codex",
+        requestId,
+        message: { id: requestId, source: "claude", content: text, timestamp: Date.now() },
+      }));
+    },
   };
   harnesses.push(harness);
 
@@ -208,7 +616,7 @@ async function startHarness(opts: {
 
 function fakeCodexScript(): string {
   return `#!/usr/bin/env bun
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 
 if (process.argv.includes("--version")) {
   console.log("codex fake");
@@ -241,7 +649,20 @@ const server = Bun.serve({
     open(ws) {
       appWs = ws;
     },
-    message() {},
+    message(ws, raw) {
+      // Minimal handshake support: auto-respond to thread/start so the adapter
+      // can detect an active thread and emit "ready" (used by budget gate tests).
+      try {
+        const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+        if (msg.method === "thread/start") {
+          ws.send(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-fake-1" } } }));
+        }
+        // Record received turn/start params (tier-override assertions).
+        if (msg.method === "turn/start" && process.env.FAKE_APP_TURNSTART_LOG) {
+          appendFileSync(process.env.FAKE_APP_TURNSTART_LOG, JSON.stringify(msg.params) + "\\n");
+        }
+      } catch {}
+    },
     close(ws) {
       if (appWs === ws) appWs = null;
     },

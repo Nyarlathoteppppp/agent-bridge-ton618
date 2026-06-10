@@ -13832,6 +13832,82 @@ class StateDirResolver {
   }
 }
 
+// src/budget/render.ts
+function formatEpoch(epochSeconds) {
+  if (!epochSeconds || epochSeconds <= 0)
+    return "\u672A\u77E5";
+  return new Date(epochSeconds * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+}
+function formatWindow(window, label) {
+  if (!window)
+    return `${label} \u672A\u77E5`;
+  return `${label} ${window.util}%\uFF08\u91CD\u7F6E ${formatEpoch(window.resetEpoch)}\uFF09`;
+}
+function formatAgent(name, usage) {
+  if (!usage)
+    return `${name}\uFF1A\u672A\u77E5\uFF08\u63A2\u6D4B\u4E0D\u53EF\u7528\uFF09`;
+  const parts = [
+    formatWindow(usage.fiveHour, "5h"),
+    formatWindow(usage.weekly, "\u5468"),
+    `\u95E8\u63A7 ${usage.gateUtil}%`,
+    `\u9884\u8B66 ${usage.warnUtil}%`
+  ];
+  if (usage.rateLimitedUntil > 0) {
+    parts.push(`\u9650\u6D41\u81F3 ${formatEpoch(usage.rateLimitedUntil)}`);
+  }
+  if (usage.stale)
+    parts.push("\uFF08\u7F13\u5B58\u6570\u636E\uFF09");
+  return `${name}\uFF1A${parts.join(" \xB7 ")}`;
+}
+var PHASE_LABELS = {
+  normal: "normal\uFF08\u6B63\u5E38\uFF09",
+  balance: "balance\uFF08\u9700\u5747\u8861\uFF09",
+  parallel: "parallel\uFF08\u5EFA\u8BAE\u5E76\u884C\u63D0\u901F\uFF09",
+  paused: "paused\uFF08\u9884\u7B97\u5E72\u9884\u4E2D\uFF09"
+};
+function renderBudgetSnapshot(snapshot) {
+  const lines = [];
+  lines.push(`\u3010\u9884\u7B97\u5FEB\u7167 \xB7 \u8D26\u53F7\u7EA7\u3011\u9636\u6BB5\uFF1A${PHASE_LABELS[snapshot.phase]} \xB7 \u66F4\u65B0\u4E8E ${formatEpoch(snapshot.updatedAt)}`);
+  lines.push(formatAgent("Claude", snapshot.claude));
+  lines.push(formatAgent("Codex", snapshot.codex));
+  if (snapshot.claude && snapshot.codex) {
+    const abs = Math.abs(snapshot.driftPct);
+    if (abs > 0) {
+      const heavier = snapshot.driftPct > 0 ? "Claude" : "Codex";
+      const lighter = snapshot.driftPct > 0 ? "Codex" : "Claude";
+      lines.push(`\u6F02\u79FB\uFF1A${heavier} \u6BD4 ${lighter} \u9AD8 ${abs} \u4E2A\u767E\u5206\u70B9`);
+    } else {
+      lines.push("\u6F02\u79FB\uFF1A\u53CC\u65B9\u6301\u5E73");
+    }
+  }
+  if (snapshot.paused) {
+    const resume = snapshot.resumeAfterEpoch ? `\uFF1B\u9884\u8BA1\u6062\u590D ${formatEpoch(snapshot.resumeAfterEpoch)}\uFF08\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09` : "";
+    const reason = snapshot.pauseReason ?? "\u989D\u5EA6\u63A5\u8FD1\u8017\u5C3D";
+    if (snapshot.pauseSide === "claude" && !snapshot.gateClosed) {
+      lines.push(`\u63A5\u529B\u4E2D\uFF1AClaude \u4FA7\u989D\u5EA6\u8017\u5C3D\uFF0C\u5DF2\u4EA4\u63A5 Codex \u7EE7\u7EED\u63A8\u8FDB\uFF08\u95F8\u95E8\u5F00\u653E\uFF09 \u2014 ${reason}${resume}`);
+    } else if (snapshot.pauseSide === "codex") {
+      lines.push(`\u6682\u505C\uFF1ACodex \u4FA7\u989D\u5EA6\u8017\u5C3D\uFF08\u95F8\u95E8\u5173\u95ED\uFF0CClaude \u53EF solo \u63A8\u8FDB\u72EC\u7ACB\u90E8\u5206\uFF09 \u2014 ${reason}${resume}`);
+    } else {
+      lines.push(`\u6682\u505C\uFF1A\u53CC\u4FA7\u8054\u5408\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09 \u2014 ${reason}${resume}`);
+    }
+  } else {
+    lines.push("\u6682\u505C\uFF1A\u5426");
+  }
+  if (snapshot.parallelRecommended) {
+    lines.push("\u5E76\u884C\u5EFA\u8BAE\uFF1A\u989D\u5EA6\u5BCC\u4F59\u4E14\u4E34\u8FD1\u7ED3\u7B97\uFF0C\u5EFA\u8BAE\u62C6\u5206\u66F4\u591A\u5E76\u884C\u5B50\u4EFB\u52A1");
+  }
+  if (snapshot.codexTier !== "full") {
+    lines.push(`Codex \u6863\u4F4D\uFF1A${snapshot.codexTier}`);
+  }
+  if (snapshot.claudeAdvice) {
+    lines.push(`Claude \u5EFA\u8BAE\uFF1A${snapshot.claudeAdvice}`);
+  }
+  lines.push("\u6CE8\uFF1A\u767E\u5206\u6BD4\u4E3A\u8BA2\u9605\u8D26\u53F7\u7EA7\u7528\u91CF\uFF08\u540C\u673A\u5176\u4ED6\u4F1A\u8BDD\u5171\u4EAB\u540C\u4E00\u989D\u5EA6\u6C60\uFF09\u3002");
+  return lines.join(`
+`);
+}
+var BUDGET_UNAVAILABLE_TEXT = "\u9884\u7B97\u611F\u77E5\u4E0D\u53EF\u7528\uFF1A\u672A\u68C0\u6D4B\u5230 agent-quota-guard \u63A2\u9488\uFF08~/.budget-guard/bin/budget-probe\uFF09\u6216 budget \u529F\u80FD\u5DF2\u7981\u7528\u3002\u534F\u4F5C\u4E0D\u53D7\u5F71\u54CD\u3002";
+
 // src/claude-adapter.ts
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
@@ -13864,7 +13940,11 @@ var CLAUDE_INSTRUCTIONS = [
   "## Turn coordination",
   "- When you see '\u23F3 Codex is working', do NOT call the reply tool \u2014 wait for '\u2705 Codex finished'.",
   "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
-  "- If the reply tool returns a busy error, Codex is still executing \u2014 wait and try again later."
+  "- If the reply tool returns a busy error, Codex is still executing \u2014 wait and try again later.",
+  "",
+  "## Budget awareness",
+  "- Use the get_budget tool to check both agents' subscription quota (5h/weekly windows, drift, pause state).",
+  "- If the reply tool returns a budget-pause error, do NOT retry; checkpoint your work and wait for the resume notice."
 ].join(`
 `);
 
@@ -13882,6 +13962,7 @@ class ClaudeAdapter extends EventEmitter {
   pendingMessages = [];
   maxBufferedMessages;
   droppedMessageCount = 0;
+  budgetSnapshot = null;
   constructor(logFile = new StateDirResolver().logFile) {
     super();
     this.logFile = logFile;
@@ -13917,6 +13998,9 @@ class ClaudeAdapter extends EventEmitter {
   }
   getPendingMessageCount() {
     return this.pendingMessages.length;
+  }
+  setBudgetSnapshot(snapshot) {
+    this.budgetSnapshot = snapshot;
   }
   resolveMode() {
     if (this.resolvedMode)
@@ -14041,6 +14125,15 @@ ${formatted}`
             properties: {},
             required: []
           }
+        },
+        {
+          name: "get_budget",
+          description: "Check both agents' subscription quota usage (Claude + Codex): 5h/weekly window percentages, drift between the two sides, joint-pause state and model/effort tier recommendation.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            required: []
+          }
         }
       ]
     }));
@@ -14052,11 +14145,21 @@ ${formatted}`
       if (name === "get_messages") {
         return this.drainMessages();
       }
+      if (name === "get_budget") {
+        return this.handleGetBudget();
+      }
       return {
         content: [{ type: "text", text: `Unknown tool: ${name}` }],
         isError: true
       };
     });
+  }
+  handleGetBudget() {
+    this.log(`get_budget called (instance=${this.instanceId}, hasSnapshot=${this.budgetSnapshot !== null})`);
+    const text = this.budgetSnapshot ? renderBudgetSnapshot(this.budgetSnapshot) : BUDGET_UNAVAILABLE_TEXT;
+    return {
+      content: [{ type: "text", text }]
+    };
   }
   async handleReply(args) {
     const text = args?.text;
@@ -14116,7 +14219,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("33d46d8", "source"),
+  commit: defineString("8e4ca6a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -14760,6 +14863,23 @@ function isProcessAlive(pid) {
 // src/config-service.ts
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
 import { join as join2 } from "path";
+var DEFAULT_BUDGET_CONFIG = {
+  enabled: true,
+  pollSeconds: 60,
+  pauseAt: 90,
+  resumeBelow: 30,
+  syncDriftPct: 10,
+  parallel: {
+    minRemainingPct: 60,
+    timeWindowSec: 3600
+  },
+  codexTierControl: false,
+  codexTiers: {
+    full: null,
+    balanced: { effort: "medium" },
+    eco: { effort: "low" }
+  }
+};
 var DEFAULT_CONFIG = {
   version: "1.0",
   codex: {
@@ -14769,7 +14889,8 @@ var DEFAULT_CONFIG = {
   turnCoordination: {
     attentionWindowSeconds: 15
   },
-  idleShutdownSeconds: 30
+  idleShutdownSeconds: 30,
+  budget: DEFAULT_BUDGET_CONFIG
 };
 var CONFIG_DIR = ".agentbridge";
 var CONFIG_FILE = "config.json";
@@ -14785,6 +14906,63 @@ function normalizeInteger(value, fallback) {
       return parsed;
   }
   return fallback;
+}
+function normalizeBoundedInteger(value, fallback, min, max) {
+  const parsed = normalizeInteger(value, fallback);
+  if (parsed < min || parsed > max)
+    return fallback;
+  return parsed;
+}
+function normalizeBoolean(value, fallback) {
+  if (typeof value === "boolean")
+    return value;
+  if (value === "true" || value === "1")
+    return true;
+  if (value === "false" || value === "0")
+    return false;
+  return fallback;
+}
+function normalizeCodexOverride(raw) {
+  if (!isRecord(raw))
+    return null;
+  const override = {};
+  if (typeof raw.model === "string" && raw.model.trim() !== "")
+    override.model = raw.model.trim();
+  if (typeof raw.effort === "string" && raw.effort.trim() !== "")
+    override.effort = raw.effort.trim();
+  return Object.keys(override).length > 0 ? override : null;
+}
+function normalizeCodexTiers(raw) {
+  const tiers = isRecord(raw) ? raw : {};
+  return {
+    full: normalizeCodexOverride(tiers.full),
+    balanced: normalizeCodexOverride(tiers.balanced) ?? DEFAULT_BUDGET_CONFIG.codexTiers.balanced,
+    eco: normalizeCodexOverride(tiers.eco) ?? DEFAULT_BUDGET_CONFIG.codexTiers.eco
+  };
+}
+function normalizeBudgetConfig(raw) {
+  const budget = isRecord(raw) ? raw : {};
+  const parallel = isRecord(budget.parallel) ? budget.parallel : {};
+  const codexTiers = normalizeCodexTiers(budget.codexTiers);
+  let pauseAt = normalizeBoundedInteger(budget.pauseAt, DEFAULT_BUDGET_CONFIG.pauseAt, 1, 100);
+  let resumeBelow = normalizeBoundedInteger(budget.resumeBelow, DEFAULT_BUDGET_CONFIG.resumeBelow, 0, 99);
+  if (pauseAt <= resumeBelow) {
+    pauseAt = DEFAULT_BUDGET_CONFIG.pauseAt;
+    resumeBelow = DEFAULT_BUDGET_CONFIG.resumeBelow;
+  }
+  return {
+    enabled: normalizeBoolean(budget.enabled, DEFAULT_BUDGET_CONFIG.enabled),
+    pollSeconds: normalizeBoundedInteger(budget.pollSeconds, DEFAULT_BUDGET_CONFIG.pollSeconds, 5, 3600),
+    pauseAt,
+    resumeBelow,
+    syncDriftPct: normalizeBoundedInteger(budget.syncDriftPct, DEFAULT_BUDGET_CONFIG.syncDriftPct, 1, 100),
+    parallel: {
+      minRemainingPct: normalizeBoundedInteger(parallel.minRemainingPct, DEFAULT_BUDGET_CONFIG.parallel.minRemainingPct, 1, 100),
+      timeWindowSec: normalizeBoundedInteger(parallel.timeWindowSec, DEFAULT_BUDGET_CONFIG.parallel.timeWindowSec, 60, 604800)
+    },
+    codexTierControl: normalizeBoolean(budget.codexTierControl, DEFAULT_BUDGET_CONFIG.codexTierControl) && codexTiers.full !== null,
+    codexTiers
+  };
 }
 function normalizeConfig(raw) {
   if (!isRecord(raw))
@@ -14802,7 +14980,8 @@ function normalizeConfig(raw) {
     turnCoordination: {
       attentionWindowSeconds: normalizeInteger(turnCoordination.attentionWindowSeconds, DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds)
     },
-    idleShutdownSeconds: normalizeInteger(config2.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds)
+    idleShutdownSeconds: normalizeInteger(config2.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds),
+    budget: normalizeBudgetConfig(config2.budget)
   };
 }
 
@@ -15168,6 +15347,7 @@ var daemonDisabled = false;
 var daemonDisabledReason = null;
 var hasSeenTuiConnect = false;
 var previousTuiConnected = false;
+var pullModePauseWarned = false;
 var RECONNECT_NOTIFY_COOLDOWN_MS = 30000;
 var DISABLED_RECOVERY_INTERVAL_MS = 5000;
 var lastDisconnectNotifyTs = 0;
@@ -15216,6 +15396,11 @@ daemonClient.on("codexMessage", (message) => {
 });
 daemonClient.on("status", (status) => {
   log(`Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`);
+  claude.setBudgetSnapshot(status.budget ?? null);
+  if (status.budget?.paused && claude.getDeliveryMode() === "pull" && !pullModePauseWarned) {
+    pullModePauseWarned = true;
+    log("Budget pause active while delivery mode is pull \u2014 the RESUME notice cannot wake an idle Claude session; " + "rely on get_messages polling or the (P5) watchdog to resume.");
+  }
   if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {
     hasSeenTuiConnect = true;
     log("First TUI connect detected \u2014 sending kickoff message to Claude");
