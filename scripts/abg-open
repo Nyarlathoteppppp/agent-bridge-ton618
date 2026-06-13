@@ -1,0 +1,222 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+DEFAULT_WORKSPACE="${ABG_COWORK_DIR:-/Users/ywbw/cowork}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  abg-open [path] [options]
+
+Path:
+  If omitted, uses $ABG_COWORK_DIR or /Users/ywbw/cowork.
+  If path is a file, uses the file's parent directory.
+
+Options:
+  --model MODEL      Claude-side model, default: $ABG_CLAUDE_MODEL or deepseek-v4-pro
+  --pro              Shortcut for --model deepseek-v4-pro
+  --flash            Shortcut for --model deepseek-v4-flash
+  --pair NAME        AgentBridge pair name, default: main
+  --resume           Resume the last Claude session and current Codex thread for this pair
+  --new-codex        Start a fresh Codex thread
+  --logs             Open a third Terminal window with abg logs -f
+  --doctor           Run abg doctor before opening windows
+  --kill-stale       Run abg kill for this pair before opening windows
+  --unsafe           Do not use safe mode for abg claude/codex/resume
+  --no-init          Do not auto-run abg init when .agentbridge/config.json is missing
+  -h, --help         Show this help
+
+Examples:
+  abg-open
+  abg-open --resume --logs
+  abg-open /path/to/project --pair review
+  abg-open /path/to/project/file.gd --doctor
+EOF
+}
+
+target=""
+model="${ABG_CLAUDE_MODEL:-deepseek-v4-pro}"
+pair="main"
+safe_flag="--safe"
+auto_init=1
+resume=0
+open_logs=0
+run_doctor=0
+kill_stale=0
+codex_extra=()
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --model)
+      if (( $# < 2 )); then
+        echo "abg-open: --model requires a value" >&2
+        exit 2
+      fi
+      model="$2"
+      shift 2
+      ;;
+    --pair)
+      if (( $# < 2 )); then
+        echo "abg-open: --pair requires a value" >&2
+        exit 2
+      fi
+      pair="$2"
+      shift 2
+      ;;
+    --pro)
+      model="deepseek-v4-pro"
+      shift
+      ;;
+    --flash)
+      model="deepseek-v4-flash"
+      shift
+      ;;
+    --resume)
+      resume=1
+      shift
+      ;;
+    --logs)
+      open_logs=1
+      shift
+      ;;
+    --doctor)
+      run_doctor=1
+      shift
+      ;;
+    --kill-stale)
+      kill_stale=1
+      shift
+      ;;
+    --unsafe)
+      safe_flag=""
+      shift
+      ;;
+    --no-init)
+      auto_init=0
+      shift
+      ;;
+    --new-codex)
+      codex_extra+=(--new)
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "abg-open: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "$target" ]]; then
+        echo "abg-open: only one path argument is supported" >&2
+        exit 2
+      fi
+      target="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$target" ]]; then
+  target="$DEFAULT_WORKSPACE"
+fi
+
+if [[ -d "$target" ]]; then
+  workspace="$target"
+elif [[ -f "$target" ]]; then
+  workspace="$(dirname "$target")"
+elif [[ -d "$(dirname "$target")" ]]; then
+  workspace="$(dirname "$target")"
+else
+  echo "abg-open: path does not exist and parent directory is missing: $target" >&2
+  exit 1
+fi
+
+workspace="$(cd "$workspace" && pwd -P)"
+
+for cmd in abg osascript; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "abg-open: missing command: $cmd" >&2
+    exit 1
+  fi
+done
+
+abg_prefix=(abg)
+if [[ "$pair" != "main" ]]; then
+  abg_prefix+=(--pair "$pair")
+fi
+
+if (( auto_init )) && [[ ! -f "$workspace/.agentbridge/config.json" ]]; then
+  echo "[abg-open] Initializing AgentBridge in $workspace"
+  (cd "$workspace" && abg init)
+fi
+
+if (( kill_stale )); then
+  echo "[abg-open] Killing existing pair '$pair' in $workspace"
+  (cd "$workspace" && "${abg_prefix[@]}" kill || true)
+fi
+
+if (( run_doctor )); then
+  echo "[abg-open] Running doctor for pair '$pair' in $workspace"
+  (cd "$workspace" && "${abg_prefix[@]}" doctor)
+fi
+
+q_workspace=${(q)workspace}
+q_model=${(q)model}
+q_pair=${(q)pair}
+q_safe=${safe_flag:+ ${(q)safe_flag}}
+q_safe_env=${safe_flag:+AGENTBRIDGE_SAFE=1 }
+
+if [[ "$pair" == "main" ]]; then
+  q_abg="abg"
+else
+  q_abg="abg --pair $q_pair"
+fi
+
+if (( resume )); then
+  claude_action="resume claude"
+  codex_action="resume codex"
+else
+  claude_action="claude$q_safe"
+  codex_action="codex$q_safe ${codex_extra[*]}"
+fi
+
+claude_cmd="cd $q_workspace; ANTHROPIC_MODEL=$q_model $q_safe_env$q_abg $claude_action; status=\$?; echo; echo '[abg-open] Claude exited with status' \$status; exec zsh -l"
+codex_cmd="cd $q_workspace; $q_safe_env$q_abg $codex_action; status=\$?; echo; echo '[abg-open] Codex exited with status' \$status; exec zsh -l"
+logs_cmd="cd $q_workspace; $q_abg logs -f -n 120; status=\$?; echo; echo '[abg-open] Logs exited with status' \$status; exec zsh -l"
+
+as_string() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+echo "[abg-open] workspace: $workspace"
+echo "[abg-open] pair: $pair"
+echo "[abg-open] claude model: $model"
+if (( resume )); then
+  echo "[abg-open] mode: resume"
+else
+  echo "[abg-open] mode: new/continue launcher"
+fi
+
+osascript_args=(
+  -e 'tell application "Terminal"'
+  -e 'activate'
+  -e "do script $(as_string "$claude_cmd")"
+  -e "do script $(as_string "$codex_cmd")"
+)
+
+if (( open_logs )); then
+  osascript_args+=(-e "do script $(as_string "$logs_cmd")")
+fi
+
+osascript_args+=(-e 'end tell')
+osascript "${osascript_args[@]}"
