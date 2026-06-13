@@ -10150,7 +10150,7 @@ function finalize(ctx, schema) {
     result.$schema = "http://json-schema.org/draft-07/schema#";
   } else if (ctx.target === "draft-04") {
     result.$schema = "http://json-schema.org/draft-04/schema#";
-  } else if (ctx.target === "openapi-3.0") {} else {}
+  } else if (ctx.target === "openapi-3.0") {}
   if (ctx.external?.uri) {
     const id = ctx.external.registry.get(schema)?.id;
     if (!id)
@@ -10372,7 +10372,7 @@ var literalProcessor = (schema, ctx, json, _params) => {
     if (val === undefined) {
       if (ctx.unrepresentable === "throw") {
         throw new Error("Literal `undefined` cannot be represented in JSON Schema");
-      } else {}
+      }
     } else if (typeof val === "bigint") {
       if (ctx.unrepresentable === "throw") {
         throw new Error("BigInt literals cannot be represented in JSON Schema");
@@ -14073,6 +14073,9 @@ var DEFAULT_MAX_BUFFERED_MESSAGES = 100;
 var DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 var DEFAULT_DEDUPE_CAPACITY = 2048;
 var DEFAULT_DEDUPE_TTL_MS = 20 * 60 * 1000;
+var DEFAULT_REPLY_AND_WAIT_TIMEOUT_MS = 180000;
+var MIN_REPLY_AND_WAIT_TIMEOUT_MS = 1000;
+var MAX_REPLY_AND_WAIT_TIMEOUT_MS = 600000;
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
@@ -14133,6 +14136,7 @@ class ClaudeAdapter extends EventEmitter {
   dedupeTtlMs;
   monotonicNow;
   deliveredMessageIds = new Map;
+  replyWaiters = new Map;
   budgetSnapshot = null;
   constructor(logFile = new StateDirResolver().logFile, options = {}) {
     super();
@@ -14178,6 +14182,7 @@ class ClaudeAdapter extends EventEmitter {
     this.log(`pushNotification (instance=${this.instanceId}, msgId=${message.id}, len=${message.content.length})`);
     if (!this.rememberDelivery(message))
       return;
+    this.tryResolveReplyWaiters(message);
     await this.pushViaChannel(message);
   }
   async pushViaChannel(message) {
@@ -14352,6 +14357,42 @@ chat_id: ${this.sessionId}`);
           }
         },
         {
+          name: "reply_and_wait",
+          description: "Send a required reply to Codex and wait until Codex responds with a matching Request-ID and delivery marker, or until timeout.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              text: {
+                type: "string",
+                description: "The message to send to Codex."
+              },
+              request_id: {
+                type: "string",
+                description: "Optional Request-ID to append and match. Generated when omitted."
+              },
+              timeout_ms: {
+                type: "number",
+                description: `How long to wait for a matching Codex reply (${MIN_REPLY_AND_WAIT_TIMEOUT_MS}-${MAX_REPLY_AND_WAIT_TIMEOUT_MS} ms). Defaults to ${DEFAULT_REPLY_AND_WAIT_TIMEOUT_MS}.`
+              },
+              deliver_marker: {
+                type: "string",
+                enum: ["[IMPORTANT]", "[STATUS]", "[FYI]", "any"],
+                description: "Which Codex marker is accepted as the final reply. Defaults to [IMPORTANT]."
+              },
+              on_busy: {
+                type: "string",
+                enum: ["reject", "steer", "interrupt"],
+                description: "What to do when Codex is mid-turn. Same semantics as reply."
+              },
+              idempotency_key: {
+                type: "string",
+                description: "Optional client-generated key that makes this logical message idempotent. Same constraints as reply."
+              }
+            },
+            required: ["text"]
+          }
+        },
+        {
           name: "get_messages",
           description: "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex.",
           inputSchema: {
@@ -14376,6 +14417,9 @@ chat_id: ${this.sessionId}`);
       if (name === "reply") {
         return this.handleReply(args);
       }
+      if (name === "reply_and_wait") {
+        return this.handleReplyAndWait(args);
+      }
       if (name === "get_messages") {
         return this.drainMessages();
       }
@@ -14396,6 +14440,82 @@ chat_id: ${this.sessionId}`);
     };
   }
   async handleReply(args) {
+    const parsed = this.parseReplyArgs(args);
+    if (isToolResult(parsed))
+      return parsed;
+    if (!this.replySender) {
+      this.log("No reply sender registered");
+      return {
+        content: [{ type: "text", text: "Error: bridge not initialized, cannot send reply." }],
+        isError: true
+      };
+    }
+    const bridgeMsg = this.buildBridgeMessage(parsed);
+    const result = await this.replySender(bridgeMsg, parsed.requireReply, parsed.onBusy, parsed.idempotencyKey);
+    if (!result.success) {
+      this.log(`Reply delivery failed: ${result.error}${result.code ? ` (code=${result.code})` : ""}`);
+      const codePrefix = result.code ? ` [${result.code}]` : "";
+      return {
+        content: [{ type: "text", text: `Error${codePrefix}: ${result.error}` }],
+        isError: true
+      };
+    }
+    const pending = this.pendingMessages.length;
+    let responseText = "Reply sent to Codex.";
+    if (parsed.onBusy === "steer") {
+      responseText = "Reply sent to Codex (will be steered into the running turn if one is active; watch for a system_steer_failed notice if the app-server rejects it).";
+    } else if (parsed.onBusy === "interrupt") {
+      responseText = "Reply sent to Codex as a new turn (any turn still running was interrupted first; if it had already finished, your message was simply injected).";
+    }
+    if (pending > 0) {
+      responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
+    }
+    return {
+      content: [{ type: "text", text: responseText }]
+    };
+  }
+  async handleReplyAndWait(args) {
+    const parsed = this.parseReplyAndWaitArgs(args);
+    if (isToolResult(parsed))
+      return parsed;
+    if (!this.replySender) {
+      this.log("No reply sender registered");
+      return {
+        content: [{ type: "text", text: "Error: bridge not initialized, cannot send reply." }],
+        isError: true
+      };
+    }
+    if (this.replyWaiters.has(parsed.requestId)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error [wait_conflict]: A reply_and_wait call is already waiting for ` + `Request-ID: ${parsed.requestId}. Use a unique request_id.`
+          }
+        ],
+        isError: true
+      };
+    }
+    const waitResult = this.createReplyWaiter(parsed);
+    const bridgeMsg = this.buildBridgeMessage({
+      ...parsed,
+      text: appendRequestIdInstruction(parsed.text, parsed.requestId),
+      requireReply: true
+    });
+    const result = await this.replySender(bridgeMsg, true, parsed.onBusy, parsed.idempotencyKey);
+    if (!result.success) {
+      this.cancelReplyWaiter(parsed.requestId);
+      this.log(`Reply-and-wait delivery failed: ${result.error}${result.code ? ` (code=${result.code})` : ""}`);
+      const codePrefix = result.code ? ` [${result.code}]` : "";
+      return {
+        content: [{ type: "text", text: `Error${codePrefix}: ${result.error}` }],
+        isError: true
+      };
+    }
+    this.log(`reply_and_wait armed (requestId=${parsed.requestId}, marker=${parsed.deliverMarker}, timeoutMs=${parsed.timeoutMs})`);
+    return waitResult;
+  }
+  parseReplyArgs(args) {
     const text = args?.text;
     if (!text) {
       return {
@@ -14403,7 +14523,6 @@ chat_id: ${this.sessionId}`);
         isError: true
       };
     }
-    const requireReply = args?.require_reply === true;
     const onBusyRaw = args?.on_busy;
     if (onBusyRaw !== undefined && onBusyRaw !== "reject" && onBusyRaw !== "steer" && onBusyRaw !== "interrupt") {
       return {
@@ -14427,46 +14546,158 @@ chat_id: ${this.sessionId}`);
         };
       }
     }
-    const idempotencyKey = idempotencyKeyRaw;
-    const bridgeMsg = {
-      id: args?.chat_id ?? `reply_${Date.now()}`,
-      source: "claude",
-      content: text,
-      timestamp: Date.now()
+    return {
+      text,
+      chatId: typeof args?.chat_id === "string" ? args.chat_id : undefined,
+      requireReply: args?.require_reply === true,
+      onBusy,
+      idempotencyKey: idempotencyKeyRaw
     };
-    if (!this.replySender) {
-      this.log("No reply sender registered");
+  }
+  parseReplyAndWaitArgs(args) {
+    const parsed = this.parseReplyArgs({ ...args, require_reply: true });
+    if (isToolResult(parsed))
+      return parsed;
+    const requestIdRaw = args?.request_id;
+    if (requestIdRaw !== undefined && (typeof requestIdRaw !== "string" || requestIdRaw.length === 0)) {
       return {
-        content: [{ type: "text", text: "Error: bridge not initialized, cannot send reply." }],
+        content: [{ type: "text", text: "Error: request_id must be a non-empty string." }],
         isError: true
       };
     }
-    const result = await this.replySender(bridgeMsg, requireReply, onBusy, idempotencyKey);
-    if (!result.success) {
-      this.log(`Reply delivery failed: ${result.error}${result.code ? ` (code=${result.code})` : ""}`);
-      const codePrefix = result.code ? ` [${result.code}]` : "";
+    if (typeof requestIdRaw === "string" && requestIdRaw.length > 128) {
       return {
-        content: [{ type: "text", text: `Error${codePrefix}: ${result.error}` }],
+        content: [{ type: "text", text: `Error: request_id is too long (${requestIdRaw.length} chars, max 128).` }],
         isError: true
       };
     }
-    const pending = this.pendingMessages.length;
-    let responseText = "Reply sent to Codex.";
-    if (onBusy === "steer") {
-      responseText = "Reply sent to Codex (will be steered into the running turn if one is active; watch for a system_steer_failed notice if the app-server rejects it).";
-    } else if (onBusy === "interrupt") {
-      responseText = "Reply sent to Codex as a new turn (any turn still running was interrupted first; if it had already finished, your message was simply injected).";
+    const timeoutMsRaw = args?.timeout_ms;
+    if (timeoutMsRaw !== undefined && (typeof timeoutMsRaw !== "number" || !Number.isFinite(timeoutMsRaw))) {
+      return {
+        content: [{ type: "text", text: "Error: timeout_ms must be a finite number." }],
+        isError: true
+      };
     }
-    if (pending > 0) {
-      responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
+    const timeoutMs = timeoutMsRaw === undefined ? DEFAULT_REPLY_AND_WAIT_TIMEOUT_MS : Math.floor(timeoutMsRaw);
+    if (timeoutMs < MIN_REPLY_AND_WAIT_TIMEOUT_MS || timeoutMs > MAX_REPLY_AND_WAIT_TIMEOUT_MS) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: timeout_ms must be between ${MIN_REPLY_AND_WAIT_TIMEOUT_MS} ` + `and ${MAX_REPLY_AND_WAIT_TIMEOUT_MS}.`
+          }
+        ],
+        isError: true
+      };
+    }
+    const deliverMarkerRaw = args?.deliver_marker;
+    if (deliverMarkerRaw !== undefined && deliverMarkerRaw !== "[IMPORTANT]" && deliverMarkerRaw !== "[STATUS]" && deliverMarkerRaw !== "[FYI]" && deliverMarkerRaw !== "any") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: invalid deliver_marker value ${JSON.stringify(deliverMarkerRaw)} \u2014 use "[IMPORTANT]", "[STATUS]", "[FYI]" or "any".`
+          }
+        ],
+        isError: true
+      };
     }
     return {
-      content: [{ type: "text", text: responseText }]
+      ...parsed,
+      requestId: requestIdRaw ?? generateRequestId(),
+      timeoutMs,
+      deliverMarker: deliverMarkerRaw ?? "[IMPORTANT]"
     };
+  }
+  buildBridgeMessage(args) {
+    return {
+      id: args.chatId ?? `reply_${Date.now()}`,
+      source: "claude",
+      content: args.text,
+      timestamp: Date.now()
+    };
+  }
+  createReplyWaiter(args) {
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        this.replyWaiters.delete(args.requestId);
+        resolve({
+          content: [
+            {
+              type: "text",
+              text: `Error [wait_timeout]: Timed out after ${args.timeoutMs}ms waiting for ` + `${args.deliverMarker} from Codex with Request-ID: ${args.requestId}. ` + "Call get_messages later to check for delayed replies."
+            }
+          ],
+          isError: true
+        });
+      }, args.timeoutMs);
+      this.replyWaiters.set(args.requestId, {
+        requestId: args.requestId,
+        deliverMarker: args.deliverMarker,
+        startedAt: Date.now(),
+        timeout,
+        resolve
+      });
+    });
+  }
+  cancelReplyWaiter(requestId) {
+    const waiter = this.replyWaiters.get(requestId);
+    if (!waiter)
+      return;
+    clearTimeout(waiter.timeout);
+    this.replyWaiters.delete(requestId);
+  }
+  tryResolveReplyWaiters(message) {
+    if (this.replyWaiters.size === 0)
+      return;
+    for (const waiter of this.replyWaiters.values()) {
+      if (!messageMatchesWaiter(message.content, waiter))
+        continue;
+      clearTimeout(waiter.timeout);
+      this.replyWaiters.delete(waiter.requestId);
+      const elapsedMs = Date.now() - waiter.startedAt;
+      this.log(`reply_and_wait resolved (requestId=${waiter.requestId}, elapsedMs=${elapsedMs})`);
+      waiter.resolve({
+        content: [
+          {
+            type: "text",
+            text: `[reply_and_wait matched]
+` + `Request-ID: ${waiter.requestId}
+` + `elapsed_ms: ${elapsedMs}
+
+` + message.content
+          }
+        ]
+      });
+    }
   }
   log(msg) {
     this.logger.log(msg);
   }
+}
+function appendRequestIdInstruction(text, requestId) {
+  const requestIdLine = `Request-ID: ${requestId}`;
+  const parts = [text.trimEnd()];
+  if (!text.includes(requestIdLine)) {
+    parts.push("", requestIdLine);
+  }
+  parts.push("", "Please echo this exact Request-ID line in every related response, especially the final [IMPORTANT] reply.");
+  return parts.join(`
+`);
+}
+function generateRequestId() {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  return `ask-codex-${stamp}-${randomUUID().slice(0, 8)}`;
+}
+function messageMatchesWaiter(content, waiter) {
+  if (!content.includes(`Request-ID: ${waiter.requestId}`))
+    return false;
+  if (waiter.deliverMarker === "any")
+    return true;
+  return content.trimStart().startsWith(waiter.deliverMarker);
+}
+function isToolResult(value) {
+  return "content" in value;
 }
 function parsePositiveIntegerEnv(name, fallback) {
   return positiveIntegerOr(parseInt(process.env[name] ?? "", 10), fallback);
@@ -14512,10 +14743,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("89d4c9a", "source"),
+  commit: defineString("2071137", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("1fc975838e46", "source")
+  codeHash: defineString("cabe242402e6", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)

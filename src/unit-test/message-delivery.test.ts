@@ -60,6 +60,14 @@ function withMockedChannel(adapter: any, mode: "success" | "fail" = "success") {
   return notifications;
 }
 
+async function expectStillPending(promise: Promise<unknown>) {
+  const result = await Promise.race([
+    promise.then(() => "resolved"),
+    new Promise((resolve) => setTimeout(() => resolve("pending"), 20)),
+  ]);
+  expect(result).toBe("pending");
+}
+
 describe("Push-only delivery: AGENTBRIDGE_MODE is ignored", () => {
   // Pull mode was removed (it could not wake an idle session and silently
   // broke the budget RESUME chain). Any legacy env value must be ignored.
@@ -645,6 +653,240 @@ describe("Reply idempotency_key option (protocol v2 PR B)", () => {
     expect(result.isError).toBeUndefined();
     expect(calls).toHaveLength(1);
     expect(calls[0].idempotencyKey).toBe("k".repeat(128));
+  });
+});
+
+describe("reply_and_wait tool", () => {
+  function withCapturingWaitSender(adapter: any, result: Record<string, unknown> = { success: true }) {
+    const calls: Array<{ content: string; requireReply?: boolean; onBusy?: string; idempotencyKey?: string }> = [];
+    adapter.replySender = async (msg: any, requireReply?: boolean, onBusy?: string, idempotencyKey?: string) => {
+      calls.push({ content: msg.content, requireReply, onBusy, idempotencyKey });
+      return result;
+    };
+    return calls;
+  }
+
+  test("sends a required reply with Request-ID instructions and resolves on matching IMPORTANT", async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter);
+    const calls = withCapturingWaitSender(adapter);
+
+    const resultPromise = adapter.handleReplyAndWait({
+      text: "review this plan",
+      request_id: "ask-codex-test-1",
+      timeout_ms: 1_000,
+    });
+
+    await Promise.resolve();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].requireReply).toBe(true);
+    expect(calls[0].onBusy).toBe("reject");
+    expect(calls[0].content).toContain("review this plan");
+    expect(calls[0].content).toContain("Request-ID: ask-codex-test-1");
+    expect(calls[0].content).toContain("Please echo this exact Request-ID line");
+
+    await adapter.pushNotification(makeBridgeMessage("[IMPORTANT] Done\nRequest-ID: ask-codex-test-1"));
+
+    const result = await resultPromise;
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("[reply_and_wait matched]");
+    expect(result.content[0].text).toContain("Request-ID: ask-codex-test-1");
+    expect(result.content[0].text).toContain("[IMPORTANT] Done");
+    expect(adapter.replyWaiters.size).toBe(0);
+  });
+
+  test("ignores STATUS by default and waits for IMPORTANT with the same Request-ID", async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter);
+    withCapturingWaitSender(adapter);
+
+    const resultPromise = adapter.handleReplyAndWait({
+      text: "long task",
+      request_id: "ask-codex-test-2",
+      timeout_ms: 1_000,
+    });
+
+    await Promise.resolve();
+    await adapter.pushNotification(makeBridgeMessage("[STATUS] working\nRequest-ID: ask-codex-test-2"));
+    await expectStillPending(resultPromise);
+
+    await adapter.pushNotification(makeBridgeMessage("[IMPORTANT] final\nRequest-ID: ask-codex-test-2"));
+    const result = await resultPromise;
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("[IMPORTANT] final");
+  });
+
+  test("ignores old messages with the wrong Request-ID", async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter);
+    withCapturingWaitSender(adapter);
+
+    const resultPromise = adapter.handleReplyAndWait({
+      text: "current task",
+      request_id: "ask-codex-current",
+      timeout_ms: 1_000,
+    });
+
+    await Promise.resolve();
+    await adapter.pushNotification(makeBridgeMessage("[IMPORTANT] stale\nRequest-ID: ask-codex-old"));
+    await expectStillPending(resultPromise);
+
+    await adapter.pushNotification(makeBridgeMessage("[IMPORTANT] current\nRequest-ID: ask-codex-current"));
+    const result = await resultPromise;
+    expect(result.content[0].text).toContain("[IMPORTANT] current");
+    expect(result.content[0].text).not.toContain("[IMPORTANT] stale");
+  });
+
+  test('deliver_marker="any" can resolve on STATUS', async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter);
+    withCapturingWaitSender(adapter);
+
+    const resultPromise = adapter.handleReplyAndWait({
+      text: "status is enough",
+      request_id: "ask-codex-status-ok",
+      timeout_ms: 1_000,
+      deliver_marker: "any",
+    });
+
+    await Promise.resolve();
+    await adapter.pushNotification(makeBridgeMessage("[STATUS] progress accepted\nRequest-ID: ask-codex-status-ok"));
+
+    const result = await resultPromise;
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain("[STATUS] progress accepted");
+  });
+
+  test("supports independent concurrent waits keyed by Request-ID", async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter);
+    withCapturingWaitSender(adapter);
+
+    const first = adapter.handleReplyAndWait({
+      text: "first",
+      request_id: "ask-codex-first",
+      timeout_ms: 1_000,
+    });
+    const second = adapter.handleReplyAndWait({
+      text: "second",
+      request_id: "ask-codex-second",
+      timeout_ms: 1_000,
+    });
+
+    await Promise.resolve();
+    await adapter.pushNotification(makeBridgeMessage("[IMPORTANT] second done\nRequest-ID: ask-codex-second"));
+    await expectStillPending(first);
+
+    const secondResult = await second;
+    expect(secondResult.content[0].text).toContain("second done");
+
+    await adapter.pushNotification(makeBridgeMessage("[IMPORTANT] first done\nRequest-ID: ask-codex-first"));
+    const firstResult = await first;
+    expect(firstResult.content[0].text).toContain("first done");
+  });
+
+  test("rejects a duplicate active Request-ID without replacing the existing wait", async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter);
+    const calls = withCapturingWaitSender(adapter);
+
+    const first = adapter.handleReplyAndWait({
+      text: "first",
+      request_id: "ask-codex-duplicate",
+      timeout_ms: 1_000,
+    });
+    await Promise.resolve();
+
+    const duplicate = await adapter.handleReplyAndWait({
+      text: "duplicate",
+      request_id: "ask-codex-duplicate",
+      timeout_ms: 1_000,
+    });
+
+    expect(duplicate.isError).toBe(true);
+    expect(duplicate.content[0].text).toContain("[wait_conflict]");
+    expect(calls).toHaveLength(1);
+
+    await adapter.pushNotification(makeBridgeMessage("[IMPORTANT] first done\nRequest-ID: ask-codex-duplicate"));
+    const firstResult = await first;
+    expect(firstResult.isError).toBeUndefined();
+    expect(firstResult.content[0].text).toContain("first done");
+  });
+
+  test("times out and clears the waiter", async () => {
+    const adapter = createAdapter();
+    withCapturingWaitSender(adapter);
+
+    const started = Date.now();
+    const result = await adapter.handleReplyAndWait({
+      text: "slow task",
+      request_id: "ask-codex-timeout",
+      timeout_ms: 1_000,
+    });
+
+    expect(Date.now() - started).toBeGreaterThanOrEqual(900);
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("[wait_timeout]");
+    expect(result.content[0].text).toContain("ask-codex-timeout");
+    expect(adapter.replyWaiters.size).toBe(0);
+  });
+
+  test("replySender failure returns immediately and clears the waiter", async () => {
+    const adapter = createAdapter();
+    withCapturingWaitSender(adapter, { success: false, error: "Codex is busy", code: "busy_reject" });
+
+    const result = await adapter.handleReplyAndWait({
+      text: "hello",
+      request_id: "ask-codex-busy",
+      timeout_ms: 1_000,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("[busy_reject]");
+    expect(adapter.replyWaiters.size).toBe(0);
+  });
+
+  test("reuses reply idempotency_key validation", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingWaitSender(adapter);
+
+    const result = await adapter.handleReplyAndWait({
+      text: "hello",
+      request_id: "ask-codex-idempotency",
+      idempotency_key: "",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("non-empty string");
+    expect(calls).toHaveLength(0);
+    expect(adapter.replyWaiters.size).toBe(0);
+  });
+
+  test("rejects invalid reply_and_wait-specific options before sending", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingWaitSender(adapter);
+
+    const badMarker = await adapter.handleReplyAndWait({
+      text: "hello",
+      deliver_marker: "IMPORTANT",
+    });
+    const badTimeout = await adapter.handleReplyAndWait({
+      text: "hello",
+      timeout_ms: 999,
+    });
+    const badRequestId = await adapter.handleReplyAndWait({
+      text: "hello",
+      request_id: "",
+    });
+
+    expect(badMarker.isError).toBe(true);
+    expect(badMarker.content[0].text).toContain("invalid deliver_marker");
+    expect(badTimeout.isError).toBe(true);
+    expect(badTimeout.content[0].text).toContain("timeout_ms must be between");
+    expect(badRequestId.isError).toBe(true);
+    expect(badRequestId.content[0].text).toContain("request_id must be a non-empty string");
+    expect(calls).toHaveLength(0);
+    expect(adapter.replyWaiters.size).toBe(0);
   });
 });
 
