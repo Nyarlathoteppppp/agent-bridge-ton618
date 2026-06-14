@@ -1,3 +1,36 @@
+# Nyarlathoteppppp Fork Notes
+
+This fork keeps the upstream AgentBridge README below and adds one local collaboration improvement:
+
+- Added Claude-side MCP tool `reply_and_wait`.
+- `reply_and_wait` sends a required reply to Codex and waits inside the bridge for a matching response.
+- Matching uses `Request-ID: ...` to avoid stale-message delivery.
+- Default final delivery requires a matching Codex message that starts with `[IMPORTANT]`.
+- `[STATUS]` and `[FYI]` remain progress/background markers and do not satisfy the default final gate.
+- Duplicate active `request_id` values return `wait_conflict` instead of replacing an existing waiter.
+
+Recommended Codex final response shape:
+
+```text
+[IMPORTANT] Plan review
+Verdict:
+Required changes:
+Risks:
+Suggested verification:
+Request-ID: ask-codex-...
+```
+
+To refresh the local Claude plugin cache from this fork:
+
+```bash
+bun run build:plugin
+bun src/cli.ts dev
+```
+
+Then run `/reload-plugins` inside Claude Code, or restart the AgentBridge pair.
+
+---
+
 # AgentBridge
 
 [![CI](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml)
@@ -56,60 +89,11 @@ When Claude Code closes, the foreground MCP process exits while the background d
 | Direction | Path |
 |-----------|------|
 | **Codex -> Claude** | `daemon.ts` captures `agentMessage` -> control WS -> `bridge.ts` -> `notifications/claude/channel` |
-| **Claude -> Codex** | Claude calls `reply` or `reply_and_wait` -> `bridge.ts` -> control WS -> `daemon.ts` -> `turn/start` injects into the Codex thread |
+| **Claude -> Codex** | Claude calls the `reply` tool -> `bridge.ts` -> control WS -> `daemon.ts` -> `turn/start` injects into the Codex thread |
 
 ### Loop prevention
 
 Each message carries a `source` field (`"claude"` or `"codex"`). The bridge never forwards a message back to its origin.
-
-## Fork Additions
-
-This fork adds a required-reply helper for Claude-side workflows that need Codex to answer without relying on external wakeups.
-
-### `reply_and_wait`
-
-`reply_and_wait` is an MCP tool exposed to Claude Code by the AgentBridge plugin. It sends a required reply to Codex and waits inside the bridge until a matching Codex response arrives or the timeout is reached.
-
-Compared with plain `reply(require_reply=true)` plus manual `get_messages` polling:
-
-- The wait is owned by the bridge tool call, not by ad hoc shell sleeps or external cron wakeups.
-- Matching is protected by `Request-ID`, which prevents stale Codex messages from being delivered as the answer to a new request.
-- By default, only a matching `[IMPORTANT]` Codex message is treated as the final deliverable.
-- `[STATUS]` and `[FYI]` messages can still be forwarded as progress, but they do not satisfy the default delivery gate.
-- Active duplicate `request_id` values are rejected with `wait_conflict` instead of replacing an existing waiter.
-
-Tool arguments:
-
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `text` | yes | - | Message to send to Codex |
-| `request_id` | no | generated | Stable ID that Codex must echo back |
-| `timeout_ms` | no | `180000` | Wait timeout, clamped to `1000`-`600000` ms |
-| `deliver_marker` | no | `[IMPORTANT]` | Accepted final marker: `[IMPORTANT]`, `[STATUS]`, `[FYI]`, or `any` |
-| `on_busy` | no | `reject` | Same busy behavior as `reply`: `reject`, `steer`, or `interrupt` |
-| `idempotency_key` | no | unset | Same idempotency semantics as `reply` |
-
-Recommended Codex response shape:
-
-```text
-[IMPORTANT] Plan review
-Verdict:
-Required changes:
-Risks:
-Suggested verification:
-Request-ID: ask-codex-...
-```
-
-### Request-ID delivery gate
-
-For reliable Claude/Codex collaboration, required Codex replies should follow this rule:
-
-1. Claude sends a unique `Request-ID: ...` line.
-2. Codex echoes that exact line in every related response.
-3. Claude accepts only the current Request-ID.
-4. Final delivery defaults to a matching message that starts with `[IMPORTANT]`.
-
-This replaces the earlier local workaround of quick polling plus `CronCreate`. Cron-based wakeups were unreliable in the tested local environment and are no longer the recommended path for this fork.
 
 ## Prerequisites
 
@@ -196,27 +180,6 @@ agentbridge codex
 #### Updating after code changes
 
 After modifying AgentBridge source code, re-run `agentbridge dev` to sync changes to the plugin cache, then restart Claude Code or run `/reload-plugins` in an active session.
-
-For this fork's `reply_and_wait` changes, refreshing the plugin cache is usually enough because the feature lives in the Claude plugin MCP server:
-
-```bash
-bun run build:plugin
-bun src/cli.ts dev
-```
-
-Then run this inside Claude Code:
-
-```text
-/reload-plugins
-```
-
-Only reinstall the global CLI when CLI source files changed or you want your system-wide `agentbridge` / `abg` commands to come from the local fork:
-
-```bash
-bun run install:global:local -- --force
-```
-
-The global install path stops running AgentBridge daemons after a successful install, so restart your pair afterwards.
 
 ## CLI Reference
 
